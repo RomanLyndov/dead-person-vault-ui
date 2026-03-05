@@ -1,0 +1,7 @@
+{
+  "network": "testnet",
+  "contractName": "DeadPersonVault",
+  "version": "1.0.0",
+  "entry": "build/contract.wasm",
+  "description": "Dead Person Vault — a Bitcoin-native dead-man switch contract on OP_NET testnet"
+}
