@@ -9,8 +9,10 @@
     "lint": "next lint"
   },
   "dependencies": {
+    "@btc-vision/transaction": "^1.7.31",
     "lucide-react": "^0.475.0",
     "next": "^16.1.6",
+    "opnet": "^1.8.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
   },

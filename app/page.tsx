@@ -10,9 +10,20 @@ import {
   isExpired,
   expiryPercent,
   shortAddr,
-  BTC_DECIMALS,
   BLOCKS_PER_DAY,
 } from "../lib/vault";
+import {
+  VAULT_CONTRACT_ADDRESS,
+  connectOpNetWallet,
+  getConnectedAccounts,
+  getWalletBalance,
+  fetchUTXOs,
+  fetchFeeRate,
+  encodeDeposit,
+  encodeHeartbeat,
+  encodeClaim,
+  sendVaultInteraction,
+} from "../lib/opnetWallet";
 
 const DEMO_OWNER = "opt1pvytqa0xkzm2nkzr8rf8kwvpqrjjpazjm9uwa";
 const DEMO_HEIR = "opt1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
@@ -35,15 +46,32 @@ export default function Home() {
   const [events, setEvents] = useState<VaultEvent[]>([]);
   const [depositAmount, setDepositAmount] = useState("0.01");
   const [timerDays, setTimerDays] = useState("30");
-  const [tick, setTick] = useState(0);
+  const [heirAddress, setHeirAddress] = useState(DEMO_HEIR);
 
-  // Simulate block progression
+  // Wallet state
+  const [walletAddress, setWalletAddress] = useState<string | null>(null);
+  const [walletBalance, setWalletBalance] = useState<number | null>(null);
+  const [isConnecting, setIsConnecting] = useState(false);
+  const [walletError, setWalletError] = useState<string | null>(null);
+  const [txPending, setTxPending] = useState(false);
+  const [txMessage, setTxMessage] = useState<{ type: "ok" | "err" | "info"; text: string } | null>(null);
+
+  const isSimulation = !VAULT_CONTRACT_ADDRESS;
+
   useEffect(() => {
     const interval = setInterval(() => {
       setVault((v) => ({ ...v, currentBlock: v.currentBlock + 1n }));
-      setTick((t) => t + 1);
     }, 3000);
     return () => clearInterval(interval);
+  }, []);
+
+  useEffect(() => {
+    getConnectedAccounts().then((accounts) => {
+      if (accounts.length > 0) {
+        setWalletAddress(accounts[0]!);
+        getWalletBalance().then((b) => setWalletBalance(b.total)).catch(() => {});
+      }
+    });
   }, []);
 
   const addEvent = useCallback(
@@ -56,62 +84,154 @@ export default function Home() {
     []
   );
 
-  function handleDeposit() {
+  function showTx(type: "ok" | "err" | "info", text: string) {
+    setTxMessage({ type, text });
+    setTimeout(() => setTxMessage(null), 6000);
+  }
+
+  async function handleConnect() {
+    setWalletError(null);
+    setIsConnecting(true);
+    try {
+      const accounts = await connectOpNetWallet();
+      if (accounts.length === 0) throw new Error("No accounts returned");
+      setWalletAddress(accounts[0]!);
+      getWalletBalance().then((b) => setWalletBalance(b.total)).catch(() => {});
+      setVault((v) => ({ ...v, owner: accounts[0]! }));
+    } catch (e) {
+      setWalletError(e instanceof Error ? e.message : "Connection failed");
+    } finally {
+      setIsConnecting(false);
+    }
+  }
+
+  async function ensureConnected(): Promise<string | null> {
+    if (walletAddress) return walletAddress;
+    await handleConnect();
+    return walletAddress;
+  }
+
+  async function handleDeposit() {
     const satoshis = BigInt(Math.round(parseFloat(depositAmount) * 1e8));
     if (satoshis <= 0n) return;
     const duration = BigInt(parseInt(timerDays)) * BLOCKS_PER_DAY;
-    setVault((v) => ({
-      ...v,
-      isActive: true,
-      balance: v.balance + satoshis,
-      lastHeartbeat: v.currentBlock,
-      timerDuration: duration,
-    }));
-    addEvent(
-      "Deposit",
-      `Deposited ${formatBTC(satoshis)} — timer set to ${timerDays} days`,
-      vault.currentBlock
-    );
+    if (isSimulation) {
+      setVault((v) => ({ ...v, isActive: true, balance: v.balance + satoshis, lastHeartbeat: v.currentBlock, timerDuration: duration }));
+      addEvent("Deposit", "[SIMULATION] Deposited " + formatBTC(satoshis) + " with " + timerDays + "-day timer", vault.currentBlock);
+      return;
+    }
+    const addr = await ensureConnected();
+    if (!addr) return;
+    setTxPending(true);
+    showTx("info", "Building transaction...");
+    try {
+      const [utxos, feeRate, calldata] = await Promise.all([fetchUTXOs(addr), fetchFeeRate(), encodeDeposit(heirAddress, duration, satoshis)]);
+      if (utxos.length === 0) throw new Error("No UTXOs available. Fund your wallet first.");
+      showTx("info", "Check OPWallet to sign...");
+      const result = await sendVaultInteraction(calldata, utxos, feeRate);
+      if (result.success) {
+        showTx("ok", "Deposit sent! TX: " + (result.txId?.slice(0, 16) ?? "") + "...");
+        setVault((v) => ({ ...v, isActive: true, balance: v.balance + satoshis, lastHeartbeat: v.currentBlock, timerDuration: duration }));
+        addEvent("Deposit", "Deposited " + formatBTC(satoshis) + " on-chain", vault.currentBlock);
+      } else {
+        showTx("err", result.error ?? "Transaction failed");
+        addEvent("Error", result.error ?? "Deposit failed", vault.currentBlock);
+      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Unknown error";
+      showTx("err", msg);
+      addEvent("Error", msg, vault.currentBlock);
+    } finally { setTxPending(false); }
   }
 
-  function handleHeartbeat() {
+  async function handleHeartbeat() {
     if (!vault.isActive || vault.isClaimed) return;
-    setVault((v) => ({ ...v, lastHeartbeat: v.currentBlock }));
-    addEvent("Heartbeat", "Owner reset the dead man's timer", vault.currentBlock);
+    if (isSimulation) {
+      setVault((v) => ({ ...v, lastHeartbeat: v.currentBlock }));
+      addEvent("Heartbeat", "[SIMULATION] Owner reset the dead man timer", vault.currentBlock);
+      return;
+    }
+    const addr = await ensureConnected();
+    if (!addr) return;
+    setTxPending(true);
+    showTx("info", "Building heartbeat...");
+    try {
+      const [utxos, feeRate, calldata] = await Promise.all([fetchUTXOs(addr), fetchFeeRate(), encodeHeartbeat()]);
+      showTx("info", "Check OPWallet to sign...");
+      const result = await sendVaultInteraction(calldata, utxos, feeRate);
+      if (result.success) {
+        showTx("ok", "Heartbeat sent! TX: " + (result.txId?.slice(0, 16) ?? "") + "...");
+        setVault((v) => ({ ...v, lastHeartbeat: v.currentBlock }));
+        addEvent("Heartbeat", "On-chain heartbeat sent", vault.currentBlock);
+      } else {
+        showTx("err", result.error ?? "Transaction failed");
+        addEvent("Error", result.error ?? "Heartbeat failed", vault.currentBlock);
+      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Unknown error";
+      showTx("err", msg);
+      addEvent("Error", msg, vault.currentBlock);
+    } finally { setTxPending(false); }
   }
 
-  function handleClaim() {
+  async function handleClaim() {
     if (!vault.isActive || vault.isClaimed) return;
     if (!isExpired(vault)) return;
-    setVault((v) => ({ ...v, isClaimed: true, isActive: false, balance: 0n }));
-    addEvent(
-      "Claimed",
-      `Heir claimed ${formatBTC(vault.balance)}`,
-      vault.currentBlock
-    );
+    if (isSimulation) {
+      setVault((v) => ({ ...v, isClaimed: true, isActive: false, balance: 0n }));
+      addEvent("Claimed", "[SIMULATION] Heir claimed " + formatBTC(vault.balance), vault.currentBlock);
+      return;
+    }
+    const addr = await ensureConnected();
+    if (!addr) return;
+    setTxPending(true);
+    showTx("info", "Building claim transaction...");
+    try {
+      const [utxos, feeRate, calldata] = await Promise.all([fetchUTXOs(addr), fetchFeeRate(), encodeClaim()]);
+      showTx("info", "Check OPWallet to sign...");
+      const result = await sendVaultInteraction(calldata, utxos, feeRate);
+      if (result.success) {
+        showTx("ok", "Claim sent! TX: " + (result.txId?.slice(0, 16) ?? "") + "...");
+        setVault((v) => ({ ...v, isClaimed: true, isActive: false, balance: 0n }));
+        addEvent("Claimed", "On-chain claim sent", vault.currentBlock);
+      } else {
+        showTx("err", result.error ?? "Transaction failed");
+        addEvent("Error", result.error ?? "Claim failed", vault.currentBlock);
+      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Unknown error";
+      showTx("err", msg);
+      addEvent("Error", msg, vault.currentBlock);
+    } finally { setTxPending(false); }
   }
 
   function handleReset() {
     setVault(initialState());
     setEvents([]);
+    setTxMessage(null);
   }
 
   const expired = isExpired(vault);
   const pct = expiryPercent(vault);
   const remaining = blocksRemaining(vault);
-
-  const barColor =
-    pct >= 90
-      ? "bg-red-500"
-      : pct >= 60
-      ? "bg-yellow-500"
-      : "bg-green-500";
+  const barColor = pct >= 90 ? "bg-red-500" : pct >= 60 ? "bg-yellow-500" : "bg-green-500";
 
   return (
     <main className="min-h-screen p-6 max-w-4xl mx-auto">
+      {/* TX toast */}
+      {txMessage && (
+        <div className={`fixed top-4 right-4 z-50 px-4 py-3 rounded text-sm font-mono max-w-sm shadow-lg border ${
+          txMessage.type === "ok" ? "bg-green-900 border-green-600 text-green-200"
+          : txMessage.type === "err" ? "bg-red-900 border-red-600 text-red-200"
+          : "bg-neutral-800 border-neutral-600 text-neutral-200"
+        }`}>
+          {txMessage.text}
+        </div>
+      )}
+
       {/* Header */}
       <div className="mb-8 border-b border-neutral-700 pb-6">
-        <div className="flex items-center justify-between">
+        <div className="flex items-center justify-between flex-wrap gap-4">
           <div>
             <h1 className="text-2xl font-bold text-orange-400 tracking-wider">
               ☠ DEAD PERSON VAULT
@@ -120,10 +240,40 @@ export default function Home() {
               On-chain Bitcoin inheritance — powered by OP_NET
             </p>
           </div>
-          <div className="text-right text-xs text-neutral-500">
-            <div>Block #{vault.currentBlock.toString()}</div>
-            <div className="mt-1 text-neutral-600">~3s per tick (demo)</div>
+          <div className="flex flex-col items-end gap-1">
+            {walletAddress ? (
+              <div className="flex flex-col items-end gap-1">
+                <div className="flex items-center gap-2">
+                  <div className="w-2 h-2 rounded-full bg-green-400" />
+                  <span className="text-green-400 text-xs font-mono">{shortAddr(walletAddress)}</span>
+                </div>
+                {walletBalance !== null && (
+                  <span className="text-neutral-500 text-xs">{(walletBalance / 1e8).toFixed(8)} BTC</span>
+                )}
+              </div>
+            ) : (
+              <button onClick={handleConnect} disabled={isConnecting}
+                className="bg-orange-500 hover:bg-orange-400 disabled:opacity-50 text-black font-bold py-1.5 px-4 rounded text-sm transition-colors">
+                {isConnecting ? "Connecting..." : "Connect OPWallet"}
+              </button>
+            )}
+            {walletError && <span className="text-red-400 text-xs max-w-xs text-right">{walletError}</span>}
           </div>
+        </div>
+        <div className="flex items-center justify-between mt-3">
+          <div className="text-xs text-neutral-500">
+            Block #{vault.currentBlock.toString()}
+            <span className="ml-2 text-neutral-700">~3s per tick (demo)</span>
+          </div>
+          {isSimulation ? (
+            <span className="text-xs bg-yellow-900 text-yellow-300 border border-yellow-700 px-2 py-0.5 rounded">
+              SIMULATION MODE — no contract deployed
+            </span>
+          ) : (
+            <span className="text-xs bg-green-900 text-green-300 border border-green-700 px-2 py-0.5 rounded">
+              LIVE — OP_NET Testnet
+            </span>
+          )}
         </div>
       </div>
 
@@ -162,12 +312,12 @@ export default function Home() {
               <Row label="Balance" value={formatBTC(vault.balance)} highlight />
               <Row
                 label="Owner"
-                value={shortAddr(vault.owner)}
+                value={walletAddress ? shortAddr(walletAddress) : shortAddr(vault.owner)}
                 mono
               />
               <Row
                 label="Heir"
-                value={shortAddr(vault.heir)}
+                value={shortAddr(heirAddress)}
                 mono
               />
               <Row
@@ -243,12 +393,28 @@ export default function Home() {
                     />
                   </div>
                 </div>
+                <div>
+                  <label className="text-xs text-neutral-500 block mb-1">
+                    Heir address (opt1... or tb1p...)
+                  </label>
+                  <input
+                    type="text"
+                    value={heirAddress}
+                    onChange={(e) => setHeirAddress(e.target.value)}
+                    placeholder="opt1... or tb1p..."
+                    className="w-full bg-neutral-900 border border-neutral-600 rounded px-3 py-2 text-xs font-mono text-white focus:outline-none focus:border-orange-500"
+                  />
+                </div>
                 <button
                   onClick={handleDeposit}
-                  className="w-full bg-orange-500 hover:bg-orange-400 text-black font-bold py-2 px-4 rounded text-sm transition-colors"
+                  disabled={txPending}
+                  className="w-full bg-orange-500 hover:bg-orange-400 disabled:opacity-50 text-black font-bold py-2 px-4 rounded text-sm transition-colors"
                 >
-                  DEPOSIT &amp; ACTIVATE VAULT
+                  {txPending ? "SIGNING..." : isSimulation ? "DEPOSIT & ACTIVATE VAULT (SIMULATION)" : "DEPOSIT & ACTIVATE VAULT"}
                 </button>
+                {!walletAddress && !isSimulation && (
+                  <p className="text-xs text-neutral-500 text-center">Will prompt OPWallet connection on click</p>
+                )}
               </div>
             )}
 
@@ -256,9 +422,10 @@ export default function Home() {
             {vault.isActive && !vault.isClaimed && !expired && (
               <button
                 onClick={handleHeartbeat}
-                className="w-full bg-green-700 hover:bg-green-600 text-white font-bold py-2 px-4 rounded text-sm transition-colors"
+                disabled={txPending}
+                className="w-full bg-green-700 hover:bg-green-600 disabled:opacity-50 text-white font-bold py-2 px-4 rounded text-sm transition-colors"
               >
-                ♥ SEND HEARTBEAT
+                {txPending ? "SIGNING..." : isSimulation ? "♥ SEND HEARTBEAT (SIMULATION)" : "♥ SEND HEARTBEAT"}
               </button>
             )}
 
@@ -266,9 +433,10 @@ export default function Home() {
             {vault.isActive && expired && !vault.isClaimed && (
               <button
                 onClick={handleClaim}
-                className="w-full bg-red-700 hover:bg-red-600 text-white font-bold py-2 px-4 rounded text-sm transition-colors animate-pulse"
+                disabled={txPending}
+                className="w-full bg-red-700 hover:bg-red-600 disabled:opacity-50 text-white font-bold py-2 px-4 rounded text-sm transition-colors animate-pulse"
               >
-                ⚠ HEIR: CLAIM VAULT
+                {txPending ? "SIGNING..." : isSimulation ? "⚠ HEIR: CLAIM VAULT (SIMULATION)" : "⚠ HEIR: CLAIM VAULT"}
               </button>
             )}
 
@@ -325,6 +493,13 @@ export default function Home() {
               <MethodRow name="getStatus()" color="text-blue-400" />
               <MethodRow name="isExpired()" color="text-blue-400" />
             </div>
+            {VAULT_CONTRACT_ADDRESS ? (
+              <div className="mt-3 text-xs text-neutral-500 font-mono break-all">Contract: {VAULT_CONTRACT_ADDRESS}</div>
+            ) : (
+              <div className="mt-3 text-xs text-yellow-600">
+                Contract not deployed — set VAULT_CONTRACT_ADDRESS in lib/opnetWallet.ts
+              </div>
+            )}
           </div>
 
           {/* Event log */}
