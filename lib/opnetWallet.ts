@@ -6,7 +6,7 @@ import type { UTXO } from "@btc-vision/transaction";
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 // Fill in once the contract is deployed to OP_NET testnet
-export const VAULT_CONTRACT_ADDRESS = "";
+export const VAULT_CONTRACT_ADDRESS = "opt1sqr3wssn4w90mkuym8hd0asv0m96fexay4svx7rdy";
 export const OPNET_TESTNET_RPC = "https://testnet.opnet.org";
 export const OPNET_PRIORITY_FEE = 1000n; // satoshis
 
