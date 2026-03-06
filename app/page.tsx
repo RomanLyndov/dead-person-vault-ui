@@ -5,12 +5,10 @@ import {
   VaultState,
   VaultEvent,
   formatBTC,
-  formatBlocks,
   blocksRemaining,
   isExpired,
   expiryPercent,
   shortAddr,
-  BLOCKS_PER_DAY,
 } from "../lib/vault";
 import {
   VAULT_CONTRACT_ADDRESS,
@@ -27,7 +25,6 @@ import {
   sendVaultInteraction,
 } from "../lib/opnetWallet";
 
-
 const DEMO_OWNER = "opt1pvytqa0xkzm2nkzr8rf8kwvpqrjjpazjm9uwa";
 const DEMO_HEIR = "0000000000000000000000000000000000000000000000000000000000000000";
 
@@ -41,6 +38,7 @@ function initialState(): VaultState {
     lastHeartbeat: 0n,
     timerDuration: 5n,
     currentBlock: 840000n,
+    message: undefined,
   };
 }
 
@@ -52,7 +50,6 @@ export default function Home() {
   const [heirAddress, setHeirAddress] = useState(DEMO_HEIR);
   const [capsuleMessage, setCapsuleMessage] = useState("");
 
-  // Wallet state
   const [walletAddress, setWalletAddress] = useState<string | null>(null);
   const [walletBalance, setWalletBalance] = useState<number | null>(null);
   const [isConnecting, setIsConnecting] = useState(false);
@@ -78,15 +75,9 @@ export default function Home() {
     });
   }, []);
 
-  const addEvent = useCallback(
-    (type: VaultEvent["type"], message: string, block: bigint) => {
-      setEvents((prev) => [
-        { type, message, block, timestamp: new Date() },
-        ...prev.slice(0, 19),
-      ]);
-    },
-    []
-  );
+  const addEvent = useCallback((type: VaultEvent["type"], message: string, block: bigint) => {
+    setEvents((prev) => [{ type, message, block, timestamp: new Date() }, ...prev.slice(0, 19)]);
+  }, []);
 
   function showTx(type: "ok" | "err" | "info", text: string) {
     setTxMessage({ type, text });
@@ -116,18 +107,13 @@ export default function Home() {
   }
 
   async function handleUseMyWallet() {
-    if (!isOpNetWalletInstalled()) {
-      showTx("err", "OPWallet not connected");
-      return;
-    }
+    if (!isOpNetWalletInstalled()) { showTx("err", "OPWallet not connected"); return; }
     try {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const pubkeyHex: string = await (window as any).opnet.getPublicKey();
       const bytes = new Uint8Array(pubkeyHex.match(/.{2}/g)!.map((b) => parseInt(b, 16)));
       const hashBuf = await crypto.subtle.digest("SHA-256", bytes);
-      const hex = Array.from(new Uint8Array(hashBuf))
-        .map((b) => b.toString(16).padStart(2, "0"))
-        .join("");
+      const hex = Array.from(new Uint8Array(hashBuf)).map((b) => b.toString(16).padStart(2, "0")).join("");
       setHeirAddress(hex);
       showTx("ok", "Filled heir address from your wallet public key");
     } catch (e) {
@@ -136,13 +122,13 @@ export default function Home() {
   }
 
   async function handleDeposit() {
-    console.log("DEPOSIT CLICKED");
     const satoshis = BigInt(Math.round(parseFloat(depositAmount) * 1e8));
     if (satoshis <= 0n) return;
     const duration = BigInt(parseInt(timerBlocks));
+    const msg = capsuleMessage.trim();
     if (isSimulation) {
-      setVault((v) => ({ ...v, isActive: true, balance: v.balance + satoshis, lastHeartbeat: v.currentBlock, timerDuration: duration }));
-      addEvent("Deposit", "[SIMULATION] Deposited " + formatBTC(satoshis) + " with " + timerBlocks + "-block timer", vault.currentBlock);
+      setVault((v) => ({ ...v, isActive: true, balance: v.balance + satoshis, lastHeartbeat: v.currentBlock, timerDuration: duration, message: msg || undefined }));
+      addEvent("Deposit", `[SIM] Deposited ${formatBTC(satoshis)}, timer: ${timerBlocks} blocks${msg ? ", with message" : ""}`, vault.currentBlock);
       return;
     }
     const addr = await ensureConnected();
@@ -150,35 +136,33 @@ export default function Home() {
     setTxPending(true);
     showTx("info", "Building transaction...");
     try {
-      const calldataPromise = capsuleMessage.trim()
-        ? encodeDepositWithMessage(heirAddress, duration, satoshis, capsuleMessage.trim())
+      const calldataPromise = msg
+        ? encodeDepositWithMessage(heirAddress, duration, satoshis, msg)
         : encodeDeposit(heirAddress, duration, satoshis);
       const [utxos, feeRate, calldata] = await Promise.all([fetchUTXOs(), fetchFeeRate(), calldataPromise]);
-
       if (utxos.length === 0) throw new Error("No UTXOs available. Fund your wallet first.");
       showTx("info", "Check OPWallet to sign...");
       const result = await sendVaultInteraction(calldata, utxos, feeRate, addr!);
       if (result.success) {
-        showTx("ok", "Deposit sent! TX: " + (result.txId?.slice(0, 16) ?? "") + "...");
-        setVault((v) => ({ ...v, isActive: true, balance: v.balance + satoshis, lastHeartbeat: v.currentBlock, timerDuration: duration }));
-        addEvent("Deposit", "Deposited " + formatBTC(satoshis) + " on-chain, timer: " + timerBlocks + " blocks", vault.currentBlock);
+        showTx("ok", "Vault activated! TX: " + (result.txId?.slice(0, 16) ?? "") + "...");
+        setVault((v) => ({ ...v, isActive: true, balance: v.balance + satoshis, lastHeartbeat: v.currentBlock, timerDuration: duration, message: msg || undefined }));
+        addEvent("Deposit", `Deposited ${formatBTC(satoshis)}, timer: ${timerBlocks} blocks`, vault.currentBlock);
       } else {
         showTx("err", result.error ?? "Transaction failed");
         addEvent("Error", result.error ?? "Deposit failed", vault.currentBlock);
       }
     } catch (e) {
-      const msg = e instanceof Error ? e.message : "Unknown error";
-      showTx("err", msg);
-      addEvent("Error", msg, vault.currentBlock);
+      const msg2 = e instanceof Error ? e.message : "Unknown error";
+      showTx("err", msg2);
+      addEvent("Error", msg2, vault.currentBlock);
     } finally { setTxPending(false); }
   }
-
 
   async function handleWithdraw() {
     if (!vault.isActive || vault.isClaimed) return;
     if (isSimulation) {
-      setVault((v) => ({ ...v, isActive: false, balance: 0n }));
-      addEvent("Withdrawn", "[SIMULATION] Owner withdrew " + formatBTC(vault.balance), vault.currentBlock);
+      setVault((v) => ({ ...v, isActive: false, balance: 0n, message: undefined }));
+      addEvent("Withdrawn", `[SIM] Owner cancelled vault, withdrew ${formatBTC(vault.balance)}`, vault.currentBlock);
       return;
     }
     const addr = await ensureConnected();
@@ -190,9 +174,9 @@ export default function Home() {
       showTx("info", "Check OPWallet to sign...");
       const result = await sendVaultInteraction(calldata, utxos, feeRate, addr!);
       if (result.success) {
-        showTx("ok", "Withdrawn! TX: " + (result.txId?.slice(0, 16) ?? "") + "...");
-        setVault((v) => ({ ...v, isActive: false, balance: 0n }));
-        addEvent("Withdrawn", "On-chain withdrawal sent", vault.currentBlock);
+        showTx("ok", "Vault cancelled! TX: " + (result.txId?.slice(0, 16) ?? "") + "...");
+        setVault((v) => ({ ...v, isActive: false, balance: 0n, message: undefined }));
+        addEvent("Withdrawn", "Vault cancelled on-chain", vault.currentBlock);
       } else {
         showTx("err", result.error ?? "Transaction failed");
         addEvent("Error", result.error ?? "Withdraw failed", vault.currentBlock);
@@ -206,10 +190,9 @@ export default function Home() {
 
   async function handleClaim() {
     if (!vault.isActive || vault.isClaimed) return;
-    if (!isExpired(vault)) return;
     if (isSimulation) {
       setVault((v) => ({ ...v, isClaimed: true, isActive: false, balance: 0n }));
-      addEvent("Claimed", "[SIMULATION] Heir claimed " + formatBTC(vault.balance), vault.currentBlock);
+      addEvent("Claimed", `[SIM] Heir claimed ${formatBTC(vault.balance)}`, vault.currentBlock);
       return;
     }
     const addr = await ensureConnected();
@@ -221,9 +204,9 @@ export default function Home() {
       showTx("info", "Check OPWallet to sign...");
       const result = await sendVaultInteraction(calldata, utxos, feeRate, addr!);
       if (result.success) {
-        showTx("ok", "Claim sent! TX: " + (result.txId?.slice(0, 16) ?? "") + "...");
+        showTx("ok", "Claimed! TX: " + (result.txId?.slice(0, 16) ?? "") + "...");
         setVault((v) => ({ ...v, isClaimed: true, isActive: false, balance: 0n }));
-        addEvent("Claimed", "On-chain claim sent", vault.currentBlock);
+        addEvent("Claimed", "Vault claimed on-chain", vault.currentBlock);
       } else {
         showTx("err", result.error ?? "Transaction failed");
         addEvent("Error", result.error ?? "Claim failed", vault.currentBlock);
@@ -239,51 +222,55 @@ export default function Home() {
     setVault(initialState());
     setEvents([]);
     setTxMessage(null);
+    setCapsuleMessage("");
   }
 
   const expired = isExpired(vault);
   const pct = expiryPercent(vault);
   const remaining = blocksRemaining(vault);
-  const barColor = pct >= 90 ? "bg-red-500" : pct >= 60 ? "bg-yellow-500" : "bg-green-500";
+  const barColor = pct >= 90 ? "bg-red-500" : pct >= 60 ? "bg-amber-400" : "bg-emerald-400";
 
   return (
     <main className="min-h-screen p-6 max-w-4xl mx-auto">
-      {/* TX toast */}
+      {/* Toast */}
       {txMessage && (
-        <div className={`fixed top-4 right-4 z-50 px-4 py-3 rounded text-sm font-mono max-w-sm shadow-lg border ${
-          txMessage.type === "ok" ? "bg-green-900 border-green-600 text-green-200"
-          : txMessage.type === "err" ? "bg-red-900 border-red-600 text-red-200"
-          : "bg-neutral-800 border-neutral-600 text-neutral-200"
+        <div className={`fixed top-4 right-4 z-50 px-4 py-3 rounded-lg text-sm font-mono max-w-sm shadow-xl border ${
+          txMessage.type === "ok" ? "bg-emerald-950 border-emerald-500 text-emerald-300"
+          : txMessage.type === "err" ? "bg-red-950 border-red-500 text-red-300"
+          : "bg-zinc-900 border-zinc-600 text-zinc-200"
         }`}>
           {txMessage.text}
         </div>
       )}
 
       {/* Header */}
-      <div className="mb-8 border-b border-neutral-700 pb-6">
-        <div className="flex items-center justify-between flex-wrap gap-4">
+      <div className="mb-8 pb-6 border-b border-zinc-800">
+        <div className="flex items-start justify-between flex-wrap gap-4">
           <div>
-            <h1 className="text-2xl font-bold text-orange-400 tracking-wider">
-              ☠ DEAD PERSON VAULT
+            <h1 className="text-3xl font-black tracking-tight">
+              <span className="text-amber-400">☠</span>{" "}
+              <span className="bg-gradient-to-r from-amber-400 to-orange-500 bg-clip-text text-transparent">
+                DEAD PERSON VAULT
+              </span>
             </h1>
-            <p className="text-neutral-400 text-sm mt-1">
-              On-chain Bitcoin inheritance — powered by OP_NET
+            <p className="text-zinc-500 text-sm mt-1">
+              Bitcoin inheritance on-chain — powered by OP_NET
             </p>
           </div>
           <div className="flex flex-col items-end gap-1">
             {walletAddress ? (
               <div className="flex flex-col items-end gap-1">
                 <div className="flex items-center gap-2">
-                  <div className="w-2 h-2 rounded-full bg-green-400" />
-                  <span className="text-green-400 text-xs font-mono">{shortAddr(walletAddress)}</span>
+                  <div className="w-2 h-2 rounded-full bg-emerald-400 shadow-[0_0_6px_#34d399]" />
+                  <span className="text-emerald-400 text-xs font-mono">{shortAddr(walletAddress)}</span>
                 </div>
                 {walletBalance !== null && (
-                  <span className="text-neutral-500 text-xs">{(walletBalance / 1e8).toFixed(8)} BTC</span>
+                  <span className="text-zinc-500 text-xs">{(walletBalance / 1e8).toFixed(8)} BTC</span>
                 )}
               </div>
             ) : (
               <button onClick={handleConnect} disabled={isConnecting}
-                className="bg-orange-500 hover:bg-orange-400 disabled:opacity-50 text-black font-bold py-1.5 px-4 rounded text-sm transition-colors">
+                className="bg-amber-500 hover:bg-amber-400 disabled:opacity-50 text-black font-bold py-1.5 px-4 rounded-lg text-sm transition-colors shadow-[0_0_12px_rgba(245,158,11,0.3)]">
                 {isConnecting ? "Connecting..." : "Connect OPWallet"}
               </button>
             )}
@@ -291,16 +278,15 @@ export default function Home() {
           </div>
         </div>
         <div className="flex items-center justify-between mt-3">
-          <div className="text-xs text-neutral-500">
+          <div className="text-xs text-zinc-600 font-mono">
             Block #{vault.currentBlock.toString()}
-            <span className="ml-2 text-neutral-700">~3s per tick (demo)</span>
           </div>
           {isSimulation ? (
-            <span className="text-xs bg-yellow-900 text-yellow-300 border border-yellow-700 px-2 py-0.5 rounded">
-              SIMULATION MODE — no contract deployed
+            <span className="text-xs bg-amber-950 text-amber-400 border border-amber-800 px-2 py-0.5 rounded-full">
+              SIMULATION MODE
             </span>
           ) : (
-            <span className="text-xs bg-green-900 text-green-300 border border-green-700 px-2 py-0.5 rounded">
+            <span className="text-xs bg-emerald-950 text-emerald-400 border border-emerald-800 px-2 py-0.5 rounded-full shadow-[0_0_8px_rgba(52,211,153,0.2)]">
               LIVE — OP_NET Testnet
             </span>
           )}
@@ -310,360 +296,300 @@ export default function Home() {
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
         {/* Left column */}
         <div className="space-y-4">
-          {/* Vault status card */}
-          <div className="border border-neutral-700 rounded p-4">
-            <div className="text-xs text-neutral-500 uppercase tracking-widest mb-3">
-              Vault Status
-            </div>
+
+          {/* Vault status */}
+          <div className={`rounded-xl p-4 border ${
+            vault.isClaimed ? "border-violet-700 bg-violet-950/30"
+            : vault.isActive && expired ? "border-red-600 bg-red-950/30 shadow-[0_0_20px_rgba(239,68,68,0.15)]"
+            : vault.isActive ? "border-emerald-700 bg-emerald-950/20 shadow-[0_0_20px_rgba(52,211,153,0.1)]"
+            : "border-zinc-800 bg-zinc-900/40"
+          }`}>
             <div className="flex items-center gap-3 mb-4">
-              <div
-                className={`w-3 h-3 rounded-full ${
-                  vault.isClaimed
-                    ? "bg-purple-400"
-                    : vault.isActive && expired
-                    ? "bg-red-500 animate-pulse"
-                    : vault.isActive
-                    ? "bg-green-500 animate-pulse"
-                    : "bg-neutral-600"
-                }`}
-              />
-              <span className="text-lg font-bold">
-                {vault.isClaimed
-                  ? "CLAIMED"
-                  : vault.isActive && expired
-                  ? "EXPIRED — CLAIMABLE"
-                  : vault.isActive
-                  ? "ACTIVE"
+              <div className={`w-3 h-3 rounded-full flex-shrink-0 ${
+                vault.isClaimed ? "bg-violet-400 shadow-[0_0_8px_#a78bfa]"
+                : vault.isActive && expired ? "bg-red-500 animate-pulse shadow-[0_0_8px_#ef4444]"
+                : vault.isActive ? "bg-emerald-400 animate-pulse shadow-[0_0_8px_#34d399]"
+                : "bg-zinc-600"
+              }`} />
+              <span className={`text-lg font-black tracking-wide ${
+                vault.isClaimed ? "text-violet-400"
+                : vault.isActive && expired ? "text-red-400"
+                : vault.isActive ? "text-emerald-400"
+                : "text-zinc-500"
+              }`}>
+                {vault.isClaimed ? "CLAIMED"
+                  : vault.isActive && expired ? "EXPIRED — CLAIMABLE"
+                  : vault.isActive ? "ACTIVE"
                   : "INACTIVE"}
               </span>
             </div>
 
             <div className="space-y-2 text-sm">
-              <Row label="Balance" value={formatBTC(vault.balance)} highlight />
-              <Row
-                label="Owner"
-                value={walletAddress ? shortAddr(walletAddress) : shortAddr(vault.owner)}
-                mono
-              />
-              <Row
-                label="Heir"
-                value={shortAddr(heirAddress)}
-                mono
-              />
-              <Row
-                label="Timer"
-                value={formatBlocks(vault.timerDuration)}
-              />
+              <Row label="Balance" value={formatBTC(vault.balance)} accent />
+              <Row label="Owner" value={walletAddress ? shortAddr(walletAddress) : shortAddr(vault.owner)} mono />
+              <Row label="Heir" value={shortAddr(heirAddress)} mono />
+              <Row label="Timer" value={`${vault.timerDuration} blocks`} />
               {vault.isActive && (
-                <Row
-                  label="Last heartbeat"
-                  value={`Block ${vault.lastHeartbeat.toString()}`}
-                />
+                <Row label="Last activity" value={`Block #${vault.lastHeartbeat}`} />
               )}
             </div>
+
+            {/* Time capsule message display */}
+            {vault.message && (
+              <div className="mt-4 p-3 rounded-lg border border-amber-700/50 bg-amber-950/30">
+                <div className="text-xs text-amber-500 font-bold mb-1 flex items-center gap-1">
+                  ✉ TIME CAPSULE MESSAGE
+                </div>
+                <p className="text-amber-200 text-sm italic leading-relaxed">"{vault.message}"</p>
+              </div>
+            )}
           </div>
 
           {/* Timer bar */}
           {vault.isActive && !vault.isClaimed && (
-            <div className="border border-neutral-700 rounded p-4">
-              <div className="text-xs text-neutral-500 uppercase tracking-widest mb-3">
-                Expiry Timer
-              </div>
-              <div className="w-full bg-neutral-800 rounded h-3 mb-2">
+            <div className="rounded-xl border border-zinc-800 bg-zinc-900/40 p-4">
+              <div className="text-xs text-zinc-500 uppercase tracking-widest mb-3">Expiry Timer</div>
+              <div className="w-full bg-zinc-800 rounded-full h-2.5 mb-2">
                 <div
-                  className={`h-3 rounded transition-all duration-500 ${barColor}`}
+                  className={`h-2.5 rounded-full transition-all duration-500 ${barColor} shadow-sm`}
                   style={{ width: `${Math.min(100, pct)}%` }}
                 />
               </div>
-              <div className="flex justify-between text-xs text-neutral-500">
+              <div className="flex justify-between text-xs text-zinc-500">
                 <span>{pct.toFixed(1)}% elapsed</span>
-                {expired ? (
-                  <span className="text-red-400 font-bold">TIMER EXPIRED</span>
-                ) : (
-                  <span>{formatBlocks(remaining)} left</span>
-                )}
+                {expired
+                  ? <span className="text-red-400 font-bold animate-pulse">TIMER EXPIRED</span>
+                  : <span className="text-zinc-400">{remaining.toString()} blocks left</span>}
               </div>
             </div>
           )}
 
           {/* Actions */}
-          <div className="border border-neutral-700 rounded p-4 space-y-3">
-            <div className="text-xs text-neutral-500 uppercase tracking-widest mb-3">
-              Actions
-            </div>
+          <div className="rounded-xl border border-zinc-800 bg-zinc-900/40 p-4 space-y-3">
+            <div className="text-xs text-zinc-500 uppercase tracking-widest mb-1">Actions</div>
 
-            {/* Deposit */}
+            {/* Deposit form */}
             {!vault.isActive && !vault.isClaimed && (
-              <div className="space-y-2">
+              <div className="space-y-3">
                 <div className="flex gap-2">
                   <div className="flex-1">
-                    <label className="text-xs text-neutral-500 block mb-1">
-                      Amount (BTC)
-                    </label>
-                    <input
-                      type="number"
-                      step="0.001"
-                      min="0.001"
-                      value={depositAmount}
+                    <label className="text-xs text-zinc-500 block mb-1">Amount (BTC)</label>
+                    <input type="number" step="0.001" min="0.001" value={depositAmount}
                       onChange={(e) => setDepositAmount(e.target.value)}
-                      className="w-full bg-neutral-900 border border-neutral-600 rounded px-3 py-2 text-sm text-white focus:outline-none focus:border-orange-500"
-                    />
+                      className="w-full bg-zinc-950 border border-zinc-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-amber-500 transition-colors" />
                   </div>
                   <div className="flex-1">
-                    <label className="text-xs text-neutral-500 block mb-1">
-                      Timer (blocks)
-                    </label>
-                    <input
-                      type="number"
-                      min="1"
-                      value={timerBlocks}
+                    <label className="text-xs text-zinc-500 block mb-1">Timer (blocks)</label>
+                    <input type="number" min="1" value={timerBlocks}
                       onChange={(e) => setTimerBlocks(e.target.value)}
-                      className="w-full bg-neutral-900 border border-neutral-600 rounded px-3 py-2 text-sm text-white focus:outline-none focus:border-orange-500"
-                    />
+                      className="w-full bg-zinc-950 border border-zinc-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-amber-500 transition-colors" />
                   </div>
                 </div>
+
                 <div>
                   <div className="flex items-center justify-between mb-1">
-                    <label className="text-xs text-neutral-500">
-                      Heir address (64-char hex)
-                    </label>
-                    <button
-                      type="button"
-                      onClick={handleUseMyWallet}
-                      className="text-xs text-orange-400 hover:text-orange-300 underline"
-                    >
+                    <label className="text-xs text-zinc-500">Heir address (64-char hex)</label>
+                    <button type="button" onClick={handleUseMyWallet}
+                      className="text-xs text-amber-400 hover:text-amber-300 underline transition-colors">
                       Use my wallet
                     </button>
                   </div>
-                  <input
-                    type="text"
-                    value={heirAddress}
-                    onChange={(e) => setHeirAddress(e.target.value)}
-                    placeholder="64-char hex (e.g. a1b2c3...)"
-                    className="w-full bg-neutral-900 border border-neutral-600 rounded px-3 py-2 text-xs font-mono text-white focus:outline-none focus:border-orange-500"
-                  />
-                  <p className="text-xs text-neutral-600 mt-1">
-                    Your OP_NET address = SHA-256 of your ML-DSA public key
-                  </p>
+                  <input type="text" value={heirAddress} onChange={(e) => setHeirAddress(e.target.value)}
+                    placeholder="64-char hex pubkey hash"
+                    className="w-full bg-zinc-950 border border-zinc-700 rounded-lg px-3 py-2 text-xs font-mono text-white focus:outline-none focus:border-amber-500 transition-colors" />
                 </div>
+
                 <div>
-                  <label className="text-xs text-neutral-500 block mb-1">
-                    Time capsule message <span className="text-neutral-600">(optional — stored on-chain for the heir)</span>
+                  <label className="text-xs text-zinc-500 block mb-1">
+                    ✉ Time capsule message{" "}
+                    <span className="text-zinc-600">(optional — stored on-chain for your heir)</span>
                   </label>
-                  <textarea
-                    rows={3}
-                    value={capsuleMessage}
-                    onChange={(e) => setCapsuleMessage(e.target.value)}
+                  <textarea rows={3} value={capsuleMessage} onChange={(e) => setCapsuleMessage(e.target.value)}
                     placeholder="Dear heir, if you're reading this..."
-                    className="w-full bg-neutral-900 border border-neutral-600 rounded px-3 py-2 text-sm text-white focus:outline-none focus:border-orange-500 resize-none"
-                  />
+                    className="w-full bg-zinc-950 border border-zinc-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-amber-500 transition-colors resize-none" />
                 </div>
-                <button
-                  onClick={handleDeposit}
-                  disabled={txPending}
-                  className="w-full bg-orange-500 hover:bg-orange-400 disabled:opacity-50 text-black font-bold py-2 px-4 rounded text-sm transition-colors"
-                >
-                  {txPending ? "SIGNING..." : isSimulation ? "DEPOSIT & ACTIVATE VAULT (SIMULATION)" : "DEPOSIT & ACTIVATE VAULT"}
+
+                <button onClick={handleDeposit} disabled={txPending}
+                  className="w-full bg-amber-500 hover:bg-amber-400 disabled:opacity-50 text-black font-black py-2.5 px-4 rounded-lg text-sm transition-colors shadow-[0_0_16px_rgba(245,158,11,0.25)] hover:shadow-[0_0_20px_rgba(245,158,11,0.4)]">
+                  {txPending ? "SIGNING..." : isSimulation ? "ACTIVATE VAULT (SIMULATION)" : "ACTIVATE VAULT"}
                 </button>
                 {!walletAddress && !isSimulation && (
-                  <p className="text-xs text-neutral-500 text-center">Will prompt OPWallet connection on click</p>
+                  <p className="text-xs text-zinc-600 text-center">Will prompt OPWallet on click</p>
                 )}
               </div>
             )}
 
+            {/* Claim */}
+            {vault.isActive && !vault.isClaimed && (
+              <button onClick={handleClaim} disabled={txPending || !expired}
+                className={`w-full font-black py-2.5 px-4 rounded-lg text-sm transition-colors ${
+                  expired
+                    ? "bg-red-600 hover:bg-red-500 text-white animate-pulse shadow-[0_0_20px_rgba(239,68,68,0.4)]"
+                    : "border border-zinc-700 text-zinc-600 cursor-not-allowed"
+                } disabled:opacity-50`}>
+                {txPending ? "SIGNING..." : expired
+                  ? (isSimulation ? "⚡ CLAIM VAULT (SIMULATION)" : "⚡ CLAIM VAULT")
+                  : `⚡ CLAIM (${remaining.toString()} blocks remaining)`}
+              </button>
+            )}
 
             {/* Withdraw */}
             {vault.isActive && !vault.isClaimed && (
-              <button
-                onClick={handleWithdraw}
-                disabled={txPending}
-                className="w-full border border-neutral-500 hover:border-orange-400 text-neutral-300 hover:text-orange-400 disabled:opacity-50 font-bold py-2 px-4 rounded text-sm transition-colors"
-              >
-                {txPending ? "SIGNING..." : isSimulation ? "↩ WITHDRAW (CANCEL VAULT) (SIMULATION)" : "↩ WITHDRAW (CANCEL VAULT)"}
+              <button onClick={handleWithdraw} disabled={txPending}
+                className="w-full border border-zinc-700 hover:border-zinc-500 text-zinc-400 hover:text-white disabled:opacity-50 font-bold py-2 px-4 rounded-lg text-sm transition-colors">
+                {txPending ? "SIGNING..." : isSimulation ? "↩ CANCEL VAULT (SIMULATION)" : "↩ CANCEL VAULT"}
               </button>
             )}
 
-            {/* Claim */}
-            {vault.isActive && !vault.isClaimed && (
-              <button
-                onClick={handleClaim}
-                disabled={txPending || !expired}
-                className={`w-full font-bold py-2 px-4 rounded text-sm transition-colors ${expired ? "bg-red-700 hover:bg-red-600 text-white animate-pulse" : "border border-neutral-700 text-neutral-600 cursor-not-allowed"} disabled:opacity-50`}
-              >
-                {txPending ? "SIGNING..." : expired ? (isSimulation ? "⚠ HEIR: CLAIM VAULT (SIMULATION)" : "⚠ HEIR: CLAIM VAULT") : "⚠ CLAIM (timer not expired yet)"}
-              </button>
+            {/* Claimed state — show message */}
+            {vault.isClaimed && (
+              <div className="space-y-3">
+                <div className="p-4 rounded-xl border border-violet-700 bg-violet-950/40 text-center">
+                  <div className="text-violet-400 font-black text-lg mb-1">VAULT CLAIMED</div>
+                  <div className="text-zinc-400 text-xs">The inheritance has been transferred.</div>
+                </div>
+                {vault.message && (
+                  <div className="p-4 rounded-xl border border-amber-700/60 bg-amber-950/30">
+                    <div className="text-amber-500 text-xs font-bold mb-2 flex items-center gap-1">
+                      ✉ MESSAGE FROM THE OWNER
+                    </div>
+                    <p className="text-amber-200 text-sm italic leading-relaxed">"{vault.message}"</p>
+                  </div>
+                )}
+                <button onClick={handleReset}
+                  className="w-full border border-zinc-700 hover:border-zinc-500 text-zinc-400 hover:text-white py-2 px-4 rounded-lg text-sm transition-colors">
+                  RESET
+                </button>
+              </div>
             )}
 
-            {/* Reset */}
-            {(vault.isClaimed || vault.isActive) && (
-              <button
-                onClick={handleReset}
-                className="w-full border border-neutral-600 hover:border-neutral-400 text-neutral-400 hover:text-white py-2 px-4 rounded text-sm transition-colors"
-              >
-                RESET DEMO
+            {vault.isActive && (
+              <button onClick={handleReset}
+                className="w-full border border-zinc-800 hover:border-zinc-700 text-zinc-600 hover:text-zinc-400 py-1.5 px-4 rounded-lg text-xs transition-colors">
+                Reset demo
               </button>
             )}
           </div>
         </div>
 
-        {/* Right column — event log + info */}
+        {/* Right column */}
         <div className="space-y-4">
+
           {/* How it works */}
-          <div className="border border-neutral-700 rounded p-4">
-            <div className="text-xs text-neutral-500 uppercase tracking-widest mb-3">
-              How It Works
+          <div className="rounded-xl border border-zinc-800 bg-zinc-900/40 p-4">
+            <div className="text-xs text-zinc-500 uppercase tracking-widest mb-4">How It Works</div>
+            <div className="space-y-4">
+              <Step n="1" color="text-amber-400" title="Deposit & set a timer">
+                Lock BTC on-chain with a block countdown and nominate an heir.
+                Optionally write them a time capsule message — stored permanently on Bitcoin.
+              </Step>
+              <Step n="2" color="text-emerald-400" title="Stay alive or cancel">
+                If you&apos;re alive and want your BTC back, hit{" "}
+                <code className="text-zinc-300 bg-zinc-800 px-1 rounded">Cancel Vault</code>.
+                Funds return to you immediately.
+              </Step>
+              <Step n="3" color="text-red-400" title="If you go silent...">
+                Once the timer runs out, your heir can call{" "}
+                <code className="text-zinc-300 bg-zinc-800 px-1 rounded">Claim Vault</code>{" "}
+                to inherit the BTC and read your message.
+              </Step>
+              <Step n="4" color="text-violet-400" title="100% on-chain">
+                No custodian. No middleman. Pure AssemblyScript WASM running on Bitcoin via OP_NET.
+              </Step>
             </div>
-            <ol className="space-y-2 text-sm text-neutral-300">
-              <li className="flex gap-2">
-                <span className="text-orange-400 font-bold">1.</span>
-                Owner deposits BTC and sets a timer (e.g. 30 days = 4,320 blocks).
-              </li>
-              <li className="flex gap-2">
-                <span className="text-orange-400 font-bold">2.</span>
-                Owner must call <code className="text-green-400">heartbeat()</code> before
-                the timer expires to prove they're alive.
-              </li>
-              <li className="flex gap-2">
-                <span className="text-orange-400 font-bold">3.</span>
-                If the timer runs out, the heir can call{" "}
-                <code className="text-red-400">claim()</code> to inherit the BTC.
-              </li>
-              <li className="flex gap-2">
-                <span className="text-orange-400 font-bold">4.</span>
-                All logic runs on-chain via OP_NET (AssemblyScript → WASM on Bitcoin).
-              </li>
-            </ol>
           </div>
 
           {/* Contract info */}
-          <div className="border border-neutral-700 rounded p-4">
-            <div className="text-xs text-neutral-500 uppercase tracking-widest mb-3">
-              Contract Methods
-            </div>
+          <div className="rounded-xl border border-zinc-800 bg-zinc-900/40 p-4">
+            <div className="text-xs text-zinc-500 uppercase tracking-widest mb-3">Contract</div>
             <div className="space-y-1 text-xs font-mono">
-              <MethodRow name="deposit(address,u64,u256)" color="text-orange-400" />
-              <MethodRow name="heartbeat()" color="text-green-400" />
-              <MethodRow name="claim()" color="text-red-400" />
-              <MethodRow name="getStatus()" color="text-blue-400" />
-              <MethodRow name="isExpired()" color="text-blue-400" />
+              <Method name="deposit(address,u64,u256)" color="text-amber-400" />
+              <Method name="depositWithMessage(address,u64,u256,string)" color="text-amber-300" />
+              <Method name="withdraw()" color="text-emerald-400" />
+              <Method name="claim()" color="text-red-400" />
+              <Method name="getInfo()" color="text-zinc-500" />
             </div>
-            {VAULT_CONTRACT_ADDRESS ? (
-              <div className="mt-3 text-xs text-neutral-500 font-mono break-all">Contract: {VAULT_CONTRACT_ADDRESS}</div>
-            ) : (
-              <div className="mt-3 text-xs text-yellow-600">
-                Contract not deployed — set VAULT_CONTRACT_ADDRESS in lib/opnetWallet.ts
-              </div>
+            {VAULT_CONTRACT_ADDRESS && (
+              <div className="mt-3 text-xs text-zinc-600 font-mono break-all">{VAULT_CONTRACT_ADDRESS}</div>
             )}
           </div>
 
           {/* Event log */}
-          <div className="border border-neutral-700 rounded p-4">
-            <div className="text-xs text-neutral-500 uppercase tracking-widest mb-3">
-              Event Log
-            </div>
+          <div className="rounded-xl border border-zinc-800 bg-zinc-900/40 p-4">
+            <div className="text-xs text-zinc-500 uppercase tracking-widest mb-3">Event Log</div>
             {events.length === 0 ? (
-              <div className="text-neutral-600 text-sm italic">
-                No events yet. Deposit to activate vault.
-              </div>
+              <div className="text-zinc-700 text-sm italic">No events yet.</div>
             ) : (
               <div className="space-y-2 max-h-64 overflow-y-auto">
                 {events.map((ev, i) => (
-                  <div
-                    key={i}
-                    className="text-xs border-l-2 pl-2 py-0.5"
-                    style={{
-                      borderColor:
-                        ev.type === "Deposit"
-                          ? "#f97316"
-                          : ev.type === "Heartbeat"
-                          ? "#22c55e"
-                          : ev.type === "Claimed"
-                          ? "#a855f7"
-                          : ev.type === "Withdrawn"
-                          ? "#facc15"
-                          : "#ef4444",
-                    }}
-                  >
+                  <div key={i} className="text-xs border-l-2 pl-2 py-0.5" style={{
+                    borderColor:
+                      ev.type === "Deposit" ? "#f59e0b"
+                      : ev.type === "Claimed" ? "#a78bfa"
+                      : ev.type === "Withdrawn" ? "#facc15"
+                      : ev.type === "Error" ? "#ef4444"
+                      : "#6b7280",
+                  }}>
                     <div className="flex justify-between items-start gap-2">
-                      <span
-                        className={
-                          ev.type === "Deposit"
-                            ? "text-orange-400"
-                            : ev.type === "Heartbeat"
-                            ? "text-green-400"
-                            : ev.type === "Claimed"
-                            ? "text-purple-400"
-                            : ev.type === "Withdrawn"
-                            ? "text-yellow-400"
-                            : "text-red-400"
-                        }
-                      >
-                        [{ev.type}]
-                      </span>
-                      <span className="text-neutral-600">
-                        #{ev.block.toString()}
-                      </span>
+                      <span className={
+                        ev.type === "Deposit" ? "text-amber-400"
+                        : ev.type === "Claimed" ? "text-violet-400"
+                        : ev.type === "Withdrawn" ? "text-yellow-400"
+                        : ev.type === "Error" ? "text-red-400"
+                        : "text-zinc-500"
+                      }>[{ev.type}]</span>
+                      <span className="text-zinc-600">#{ev.block.toString()}</span>
                     </div>
-                    <div className="text-neutral-300">{ev.message}</div>
+                    <div className="text-zinc-300">{ev.message}</div>
                   </div>
                 ))}
               </div>
             )}
           </div>
 
-          {/* Block info */}
-          <div className="border border-neutral-700 rounded p-4">
-            <div className="text-xs text-neutral-500 uppercase tracking-widest mb-2">
-              Bitcoin Block Info
-            </div>
-            <div className="text-xs text-neutral-400 space-y-1">
-              <div>1 day ≈ 144 blocks (10 min/block)</div>
-              <div>30 days = 4,320 blocks</div>
-              <div>1 year = 52,560 blocks</div>
-              <div className="pt-1 text-neutral-600">
-                Demo runs at 1 block / 3 seconds
-              </div>
+          {/* Bitcoin block info */}
+          <div className="rounded-xl border border-zinc-800 bg-zinc-900/40 p-4">
+            <div className="text-xs text-zinc-500 uppercase tracking-widest mb-2">Block Reference</div>
+            <div className="text-xs text-zinc-500 space-y-1 font-mono">
+              <div>1 day ≈ <span className="text-zinc-300">144 blocks</span></div>
+              <div>30 days = <span className="text-zinc-300">4,320 blocks</span></div>
+              <div>1 year = <span className="text-zinc-300">52,560 blocks</span></div>
+              <div className="pt-1 text-zinc-700">UI demo: 1 block / 3 seconds</div>
             </div>
           </div>
         </div>
       </div>
 
-      <div className="mt-8 border-t border-neutral-800 pt-4 text-center text-xs text-neutral-700">
-        Dead Person Vault — Week 2 OP_NET Vibecoding Event — AssemblyScript WASM on Bitcoin
+      <div className="mt-8 border-t border-zinc-900 pt-4 text-center text-xs text-zinc-800">
+        Dead Person Vault — OP_NET Vibecoding — AssemblyScript WASM on Bitcoin
       </div>
     </main>
   );
 }
 
-function Row({
-  label,
-  value,
-  highlight,
-  mono,
-}: {
-  label: string;
-  value: string;
-  highlight?: boolean;
-  mono?: boolean;
-}) {
+function Row({ label, value, accent, mono }: { label: string; value: string; accent?: boolean; mono?: boolean }) {
   return (
     <div className="flex justify-between items-center">
-      <span className="text-neutral-500">{label}</span>
-      <span
-        className={`${highlight ? "text-orange-400 font-bold" : "text-neutral-200"} ${
-          mono ? "font-mono text-xs" : ""
-        }`}
-      >
+      <span className="text-zinc-500">{label}</span>
+      <span className={`${accent ? "text-amber-400 font-bold" : "text-zinc-200"} ${mono ? "font-mono text-xs" : ""}`}>
         {value}
       </span>
     </div>
   );
 }
 
-function MethodRow({ name, color }: { name: string; color: string }) {
+function Step({ n, color, title, children }: { n: string; color: string; title: string; children: React.ReactNode }) {
   return (
-    <div className={`${color} opacity-80 hover:opacity-100 transition-opacity`}>
-      {name}
+    <div className="flex gap-3">
+      <div className={`${color} font-black text-lg leading-none mt-0.5 w-5 flex-shrink-0`}>{n}</div>
+      <div>
+        <div className={`${color} font-bold text-sm`}>{title}</div>
+        <div className="text-zinc-400 text-xs mt-0.5 leading-relaxed">{children}</div>
+      </div>
     </div>
   );
+}
+
+function Method({ name, color }: { name: string; color: string }) {
+  return <div className={`${color} opacity-75 hover:opacity-100 transition-opacity`}>{name}</div>;
 }

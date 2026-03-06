@@ -7,6 +7,7 @@ export interface VaultState {
   lastHeartbeat: bigint; // block number
   timerDuration: bigint; // blocks
   currentBlock: bigint;
+  message?: string;
 }
 
 export interface VaultEvent {
