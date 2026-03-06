@@ -5,10 +5,10 @@ import type { OPWallet } from "@btc-vision/transaction";
 import type { UTXO } from "@btc-vision/transaction";
 
 // ─── Config ──────────────────────────────────────────────────────────────────
-// Fill in once the contract is deployed to OP_NET testnet
 export const VAULT_CONTRACT_ADDRESS = "opt1sqr3wssn4w90mkuym8hd0asv0m96fexay4svx7rdy";
-export const OPNET_TESTNET_RPC = "https://testnet.opnet.org";
 export const OPNET_PRIORITY_FEE = 1000n; // satoshis
+export const OPNET_DEFAULT_FEE_RATE = 10;  // sat/vbyte fallback
+export const OPNET_GAS_SAT_FEE = 330n;    // sat — passed to wallet for gas
 
 // ─── Window type augmentation ─────────────────────────────────────────────────
 declare global {
@@ -24,9 +24,7 @@ export function isOpNetWalletInstalled(): boolean {
 
 export async function connectOpNetWallet(): Promise<string[]> {
   if (!isOpNetWalletInstalled()) {
-    throw new Error(
-      "OPWallet not found. Install it from https://opwallet.org"
-    );
+    throw new Error("OPWallet not found. Install it from https://opwallet.org");
   }
   return window.opnet!.requestAccounts();
 }
@@ -49,51 +47,26 @@ export async function getWalletBalance(): Promise<{
   return window.opnet!.getBalance();
 }
 
-// ─── UTXO / fee fetching via OP_NET JSON-RPC ─────────────────────────────────
-interface RawUTXO {
-  transactionId: string;
-  outputIndex: number;
-  value: string;
-  scriptPubKey?: string;
-}
+// ─── UTXO fetching via OPWallet (no direct RPC needed) ───────────────────────
+//
+// OPWallet connects to the OP_NET node through its own authenticated background
+// service.  Calling window.opnet.getBitcoinUtxos() is both simpler and more
+// reliable than hitting the public RPC endpoint from the browser.
 
-export async function fetchUTXOs(address: string): Promise<UTXO[]> {
-  const res = await fetch(OPNET_TESTNET_RPC, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      jsonrpc: "2.0",
-      id: 1,
-      method: "btc_getUTXOs",
-      params: [{ address, optimize: false }],
-    }),
-  });
-  const json = await res.json();
-  if (json.error) throw new Error(json.error.message ?? "Failed to fetch UTXOs");
-  const { confirmed = [], pending = [] }: { confirmed: RawUTXO[]; pending: RawUTXO[] } =
-    json.result ?? {};
-  const toUTXO = (u: RawUTXO): UTXO => ({
-    transactionId: u.transactionId,
-    outputIndex: u.outputIndex,
-    value: BigInt(u.value),
-    scriptPubKey: { hex: u.scriptPubKey ?? "" },
-  });
-  return [...confirmed, ...pending].map(toUTXO);
-}
-
-export async function fetchFeeRate(): Promise<number> {
+export async function fetchUTXOs(): Promise<UTXO[]> {
+  if (!isOpNetWalletInstalled()) return [];
   try {
-    const res = await fetch(OPNET_TESTNET_RPC, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "btc_gas", params: [] }),
-    });
-    const json = await res.json();
-    if (json.result?.gasPrice) return Number(json.result.gasPrice);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const raw = await (window.opnet as any).getBitcoinUtxos(0, 50);
+    if (Array.isArray(raw)) return raw as UTXO[];
   } catch {
     // fall through
   }
-  return 10;
+  return [];
+}
+
+export async function fetchFeeRate(): Promise<number> {
+  return OPNET_DEFAULT_FEE_RATE;
 }
 
 // ─── Calldata encoding ────────────────────────────────────────────────────────
@@ -129,7 +102,7 @@ function writeU256BE(v: bigint): Uint8Array {
 }
 
 function decodeAddressTo32Bytes(addr: string): Uint8Array {
-  const decoded = bech32m.decode(addr);
+  const decoded = bech32m.decode(addr, 256);
   const bytes = bech32m.fromWords(decoded.words.slice(1));
   if (bytes.length !== 32) {
     throw new Error(`Expected 32-byte address, got ${bytes.length} from: ${addr}`);
@@ -184,16 +157,15 @@ export async function sendVaultInteraction(
   }
   if (!VAULT_CONTRACT_ADDRESS) throw new Error("CONTRACT_NOT_DEPLOYED");
 
-  // The OPWallet extension supplies `network`, `signer`, and `gasSatFee` internally;
-  // we cast to bypass the strict TS type while passing the fields we control.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const [, interactionResult] =
     await window.opnet!.web3.signAndBroadcastInteraction({
-      to: VAULT_CONTRACT_ADDRESS as string,
+      to: VAULT_CONTRACT_ADDRESS,
       calldata,
       utxos,
       feeRate,
       priorityFee: OPNET_PRIORITY_FEE,
+      gasSatFee: OPNET_GAS_SAT_FEE,
     } as any);
 
   if (!interactionResult.success) {
