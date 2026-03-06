@@ -38,7 +38,7 @@ function initialState(): VaultState {
     heir: DEMO_HEIR,
     balance: 0n,
     lastHeartbeat: 0n,
-    timerDuration: 30n * BLOCKS_PER_DAY,
+    timerDuration: 5n,
     currentBlock: 840000n,
   };
 }
@@ -47,7 +47,7 @@ export default function Home() {
   const [vault, setVault] = useState<VaultState>(initialState());
   const [events, setEvents] = useState<VaultEvent[]>([]);
   const [depositAmount, setDepositAmount] = useState("0.01");
-  const [timerDays, setTimerDays] = useState("30");
+  const [timerBlocks, setTimerBlocks] = useState("5");
   const [heirAddress, setHeirAddress] = useState(DEMO_HEIR);
 
   // Wallet state
@@ -137,10 +137,10 @@ export default function Home() {
     console.log("DEPOSIT CLICKED");
     const satoshis = BigInt(Math.round(parseFloat(depositAmount) * 1e8));
     if (satoshis <= 0n) return;
-    const duration = BigInt(parseInt(timerDays)) * BLOCKS_PER_DAY;
+    const duration = BigInt(parseInt(timerBlocks));
     if (isSimulation) {
       setVault((v) => ({ ...v, isActive: true, balance: v.balance + satoshis, lastHeartbeat: v.currentBlock, timerDuration: duration }));
-      addEvent("Deposit", "[SIMULATION] Deposited " + formatBTC(satoshis) + " with " + timerDays + "-day timer", vault.currentBlock);
+      addEvent("Deposit", "[SIMULATION] Deposited " + formatBTC(satoshis) + " with " + timerBlocks + "-block timer", vault.currentBlock);
       return;
     }
     const addr = await ensureConnected();
@@ -149,13 +149,14 @@ export default function Home() {
     showTx("info", "Building transaction...");
     try {
       const [utxos, feeRate, calldata] = await Promise.all([fetchUTXOs(), fetchFeeRate(), encodeDeposit(heirAddress, duration, satoshis)]);
+
       if (utxos.length === 0) throw new Error("No UTXOs available. Fund your wallet first.");
       showTx("info", "Check OPWallet to sign...");
       const result = await sendVaultInteraction(calldata, utxos, feeRate, addr!);
       if (result.success) {
         showTx("ok", "Deposit sent! TX: " + (result.txId?.slice(0, 16) ?? "") + "...");
         setVault((v) => ({ ...v, isActive: true, balance: v.balance + satoshis, lastHeartbeat: v.currentBlock, timerDuration: duration }));
-        addEvent("Deposit", "Deposited " + formatBTC(satoshis) + " on-chain", vault.currentBlock);
+        addEvent("Deposit", "Deposited " + formatBTC(satoshis) + " on-chain, timer: " + timerBlocks + " blocks", vault.currentBlock);
       } else {
         showTx("err", result.error ?? "Transaction failed");
         addEvent("Error", result.error ?? "Deposit failed", vault.currentBlock);
@@ -434,14 +435,13 @@ export default function Home() {
                   </div>
                   <div className="flex-1">
                     <label className="text-xs text-neutral-500 block mb-1">
-                      Timer (days)
+                      Timer (blocks)
                     </label>
                     <input
                       type="number"
                       min="1"
-                      max="365"
-                      value={timerDays}
-                      onChange={(e) => setTimerDays(e.target.value)}
+                      value={timerBlocks}
+                      onChange={(e) => setTimerBlocks(e.target.value)}
                       className="w-full bg-neutral-900 border border-neutral-600 rounded px-3 py-2 text-sm text-white focus:outline-none focus:border-orange-500"
                     />
                   </div>
@@ -506,13 +506,13 @@ export default function Home() {
             )}
 
             {/* Claim */}
-            {vault.isActive && expired && !vault.isClaimed && (
+            {vault.isActive && !vault.isClaimed && (
               <button
                 onClick={handleClaim}
-                disabled={txPending}
-                className="w-full bg-red-700 hover:bg-red-600 disabled:opacity-50 text-white font-bold py-2 px-4 rounded text-sm transition-colors animate-pulse"
+                disabled={txPending || !expired}
+                className={`w-full font-bold py-2 px-4 rounded text-sm transition-colors ${expired ? "bg-red-700 hover:bg-red-600 text-white animate-pulse" : "border border-neutral-700 text-neutral-600 cursor-not-allowed"} disabled:opacity-50`}
               >
-                {txPending ? "SIGNING..." : isSimulation ? "⚠ HEIR: CLAIM VAULT (SIMULATION)" : "⚠ HEIR: CLAIM VAULT"}
+                {txPending ? "SIGNING..." : expired ? (isSimulation ? "⚠ HEIR: CLAIM VAULT (SIMULATION)" : "⚠ HEIR: CLAIM VAULT") : "⚠ CLAIM (timer not expired yet)"}
               </button>
             )}
 
