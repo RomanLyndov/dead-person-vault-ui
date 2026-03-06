@@ -1,11 +1,10 @@
 "use client";
 
-import { bech32, bech32m } from "bech32";
 import type { OPWallet } from "@btc-vision/transaction";
 import type { UTXO } from "@btc-vision/transaction";
 
 // ─── Config ──────────────────────────────────────────────────────────────────
-export const VAULT_CONTRACT_ADDRESS = "opt1sqr3wssn4w90mkuym8hd0asv0m96fexay4svx7rdy";
+export const VAULT_CONTRACT_ADDRESS = "opt1sqzhu4nxjyj7hgwx4khnfm5h5cp39xxymcsdjzrs4";
 export const OPNET_PRIORITY_FEE = 1000n; // satoshis
 export const OPNET_DEFAULT_FEE_RATE = 10;  // sat/vbyte fallback
 export const OPNET_GAS_SAT_FEE = 330n;    // sat — passed to wallet for gas
@@ -102,49 +101,49 @@ function writeU256BE(v: bigint): Uint8Array {
 }
 
 function decodeAddressTo32Bytes(addr: string): Uint8Array {
-  // OP_NET opt1q... addresses use bech32 (witness v0); opt1p.../opt1s... use bech32m (v1+).
-  // Try bech32m first, fall back to bech32 if the checksum doesn't match.
-  let words: number[];
-  try {
-    words = bech32m.decode(addr, 256).words;
-  } catch {
-    words = bech32.decode(addr, 256).words;
+  const clean = addr.startsWith("0x") ? addr.slice(2) : addr;
+  if (clean.length !== 64) {
+    throw new Error("Heir address must be a 64-character hex string");
   }
-  const bytes = bech32m.fromWords(words.slice(1));
-  if (bytes.length !== 32) {
-    throw new Error(`Expected 32-byte address, got ${bytes.length} from: ${addr}`);
+  const result = new Uint8Array(32);
+  for (let i = 0; i < 32; i++) {
+    result[i] = parseInt(clean.substring(i * 2, i * 2 + 2), 16);
   }
-  return new Uint8Array(bytes);
+  return result;
 }
 
-function concat(...arrays: Uint8Array[]): Buffer {
+function concat(...arrays: Uint8Array[]): Uint8Array {
   const total = arrays.reduce((s, a) => s + a.length, 0);
-  const out = Buffer.alloc(total);
+  const out = new Uint8Array(total);
   let offset = 0;
   for (const a of arrays) { out.set(a, offset); offset += a.length; }
   return out;
+}
+
+function toHex(bytes: Uint8Array): string {
+  return Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 export async function encodeDeposit(
   heirAddress: string,
   timerBlocks: bigint,
   satoshis: bigint
-): Promise<Buffer> {
+): Promise<string> {
   const sel = await makeSelector("deposit(address,u64,u256)");
-  return concat(
+  return toHex(concat(
     writeU32BE(sel),
     decodeAddressTo32Bytes(heirAddress),
     writeU64BE(timerBlocks),
     writeU256BE(satoshis)
-  );
+  ));
 }
 
-export async function encodeHeartbeat(): Promise<Buffer> {
-  return Buffer.from(writeU32BE(await makeSelector("heartbeat()")));
+export async function encodeHeartbeat(): Promise<string> {
+  return toHex(writeU32BE(await makeSelector("heartbeat()")));
 }
 
-export async function encodeClaim(): Promise<Buffer> {
-  return Buffer.from(writeU32BE(await makeSelector("claim()")));
+export async function encodeClaim(): Promise<string> {
+  return toHex(writeU32BE(await makeSelector("claim()")));
 }
 
 // ─── Transaction signing & broadcast ─────────────────────────────────────────
@@ -155,25 +154,30 @@ export interface TxResult {
 }
 
 export async function sendVaultInteraction(
-  calldata: Buffer,
+  calldata: string,
   utxos: UTXO[],
-  feeRate: number
+  feeRate: number,
+  from: string
 ): Promise<TxResult> {
   if (!isOpNetWalletInstalled() || !window.opnet?.web3) {
     throw new Error("OPWallet not connected");
   }
   if (!VAULT_CONTRACT_ADDRESS) throw new Error("CONTRACT_NOT_DEPLOYED");
 
+  const interactionObject = {
+    from,
+    to: VAULT_CONTRACT_ADDRESS,
+    contract: VAULT_CONTRACT_ADDRESS,
+    calldata,
+    utxos,
+    feeRate,
+    priorityFee: Number(OPNET_PRIORITY_FEE),
+    gasSatFee: Number(OPNET_GAS_SAT_FEE),
+  };
+  console.log("SENDING TO WALLET:", interactionObject);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const [, interactionResult] =
-    await window.opnet!.web3.signAndBroadcastInteraction({
-      to: VAULT_CONTRACT_ADDRESS,
-      calldata,
-      utxos,
-      feeRate,
-      priorityFee: OPNET_PRIORITY_FEE,
-      gasSatFee: OPNET_GAS_SAT_FEE,
-    } as any);
+    await window.opnet!.web3.signAndBroadcastInteraction(interactionObject as any);
 
   if (!interactionResult.success) {
     return { success: false, error: interactionResult.error ?? "Transaction failed" };
