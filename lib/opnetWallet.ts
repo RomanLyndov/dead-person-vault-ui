@@ -164,11 +164,17 @@ export async function sendVaultInteraction(
   }
   if (!VAULT_CONTRACT_ADDRESS) throw new Error("CONTRACT_NOT_DEPLOYED");
 
+  // Wallet expects calldata as Uint8Array (bytes), not a hex string.
+  // pageProvider.js applies bytesToHex() on it before sending to background.
+  const calldataBytes = new Uint8Array(
+    calldata.match(/.{2}/g)!.map((b) => parseInt(b, 16))
+  );
+
   const interactionObject = {
     from,
     to: VAULT_CONTRACT_ADDRESS,
     contract: VAULT_CONTRACT_ADDRESS,
-    calldata,
+    calldata: calldataBytes,
     utxos,
     feeRate,
     priorityFee: Number(OPNET_PRIORITY_FEE),
