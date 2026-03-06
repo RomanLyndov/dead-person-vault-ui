@@ -5,6 +5,8 @@ import type { UTXO } from "@btc-vision/transaction";
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 export const VAULT_CONTRACT_ADDRESS = "opt1sqzhu4nxjyj7hgwx4khnfm5h5cp39xxymcsdjzrs4";
+// 32-byte contract public key in hex (used as `contract` field in interaction params)
+export const VAULT_CONTRACT_PUBKEY = "6a2c571a7a5b0e2a38eeee25c1be90a5c9efd8917954ed133109a144506abd0c";
 export const OPNET_PRIORITY_FEE = 1000n; // satoshis
 export const OPNET_DEFAULT_FEE_RATE = 10;  // sat/vbyte fallback
 export const OPNET_GAS_SAT_FEE = 330n;    // sat — passed to wallet for gas
@@ -173,7 +175,7 @@ export async function sendVaultInteraction(
   const interactionObject = {
     from,
     to: VAULT_CONTRACT_ADDRESS,
-    contract: VAULT_CONTRACT_ADDRESS,
+    contract: VAULT_CONTRACT_PUBKEY,
     calldata: calldataBytes,
     utxos,
     feeRate,
