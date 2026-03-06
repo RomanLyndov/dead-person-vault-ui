@@ -125,7 +125,7 @@ export default function Home() {
     setTxPending(true);
     showTx("info", "Building transaction...");
     try {
-      const [utxos, feeRate, calldata] = await Promise.all([fetchUTXOs(addr), fetchFeeRate(), encodeDeposit(heirAddress, duration, satoshis)]);
+      const [utxos, feeRate, calldata] = await Promise.all([fetchUTXOs(), fetchFeeRate(), encodeDeposit(heirAddress, duration, satoshis)]);
       if (utxos.length === 0) throw new Error("No UTXOs available. Fund your wallet first.");
       showTx("info", "Check OPWallet to sign...");
       const result = await sendVaultInteraction(calldata, utxos, feeRate);
@@ -156,7 +156,7 @@ export default function Home() {
     setTxPending(true);
     showTx("info", "Building heartbeat...");
     try {
-      const [utxos, feeRate, calldata] = await Promise.all([fetchUTXOs(addr), fetchFeeRate(), encodeHeartbeat()]);
+      const [utxos, feeRate, calldata] = await Promise.all([fetchUTXOs(), fetchFeeRate(), encodeHeartbeat()]);
       showTx("info", "Check OPWallet to sign...");
       const result = await sendVaultInteraction(calldata, utxos, feeRate);
       if (result.success) {
@@ -187,7 +187,7 @@ export default function Home() {
     setTxPending(true);
     showTx("info", "Building claim transaction...");
     try {
-      const [utxos, feeRate, calldata] = await Promise.all([fetchUTXOs(addr), fetchFeeRate(), encodeClaim()]);
+      const [utxos, feeRate, calldata] = await Promise.all([fetchUTXOs(), fetchFeeRate(), encodeClaim()]);
       showTx("info", "Check OPWallet to sign...");
       const result = await sendVaultInteraction(calldata, utxos, feeRate);
       if (result.success) {
