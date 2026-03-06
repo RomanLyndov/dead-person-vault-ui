@@ -21,11 +21,12 @@ import {
   fetchUTXOs,
   fetchFeeRate,
   encodeDeposit,
-  encodeHeartbeat,
+  encodeDepositWithMessage,
   encodeClaim,
   encodeWithdraw,
   sendVaultInteraction,
 } from "../lib/opnetWallet";
+
 
 const DEMO_OWNER = "opt1pvytqa0xkzm2nkzr8rf8kwvpqrjjpazjm9uwa";
 const DEMO_HEIR = "0000000000000000000000000000000000000000000000000000000000000000";
@@ -49,6 +50,7 @@ export default function Home() {
   const [depositAmount, setDepositAmount] = useState("0.01");
   const [timerBlocks, setTimerBlocks] = useState("5");
   const [heirAddress, setHeirAddress] = useState(DEMO_HEIR);
+  const [capsuleMessage, setCapsuleMessage] = useState("");
 
   // Wallet state
   const [walletAddress, setWalletAddress] = useState<string | null>(null);
@@ -148,7 +150,10 @@ export default function Home() {
     setTxPending(true);
     showTx("info", "Building transaction...");
     try {
-      const [utxos, feeRate, calldata] = await Promise.all([fetchUTXOs(), fetchFeeRate(), encodeDeposit(heirAddress, duration, satoshis)]);
+      const calldataPromise = capsuleMessage.trim()
+        ? encodeDepositWithMessage(heirAddress, duration, satoshis, capsuleMessage.trim())
+        : encodeDeposit(heirAddress, duration, satoshis);
+      const [utxos, feeRate, calldata] = await Promise.all([fetchUTXOs(), fetchFeeRate(), calldataPromise]);
 
       if (utxos.length === 0) throw new Error("No UTXOs available. Fund your wallet first.");
       showTx("info", "Check OPWallet to sign...");
@@ -168,35 +173,6 @@ export default function Home() {
     } finally { setTxPending(false); }
   }
 
-  async function handleHeartbeat() {
-    if (!vault.isActive || vault.isClaimed) return;
-    if (isSimulation) {
-      setVault((v) => ({ ...v, lastHeartbeat: v.currentBlock }));
-      addEvent("Heartbeat", "[SIMULATION] Owner reset the dead man timer", vault.currentBlock);
-      return;
-    }
-    const addr = await ensureConnected();
-    if (!addr) return;
-    setTxPending(true);
-    showTx("info", "Building heartbeat...");
-    try {
-      const [utxos, feeRate, calldata] = await Promise.all([fetchUTXOs(), fetchFeeRate(), encodeHeartbeat()]);
-      showTx("info", "Check OPWallet to sign...");
-      const result = await sendVaultInteraction(calldata, utxos, feeRate, addr!);
-      if (result.success) {
-        showTx("ok", "Heartbeat sent! TX: " + (result.txId?.slice(0, 16) ?? "") + "...");
-        setVault((v) => ({ ...v, lastHeartbeat: v.currentBlock }));
-        addEvent("Heartbeat", "On-chain heartbeat sent", vault.currentBlock);
-      } else {
-        showTx("err", result.error ?? "Transaction failed");
-        addEvent("Error", result.error ?? "Heartbeat failed", vault.currentBlock);
-      }
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : "Unknown error";
-      showTx("err", msg);
-      addEvent("Error", msg, vault.currentBlock);
-    } finally { setTxPending(false); }
-  }
 
   async function handleWithdraw() {
     if (!vault.isActive || vault.isClaimed) return;
@@ -470,6 +446,18 @@ export default function Home() {
                     Your OP_NET address = SHA-256 of your ML-DSA public key
                   </p>
                 </div>
+                <div>
+                  <label className="text-xs text-neutral-500 block mb-1">
+                    Time capsule message <span className="text-neutral-600">(optional — stored on-chain for the heir)</span>
+                  </label>
+                  <textarea
+                    rows={3}
+                    value={capsuleMessage}
+                    onChange={(e) => setCapsuleMessage(e.target.value)}
+                    placeholder="Dear heir, if you're reading this..."
+                    className="w-full bg-neutral-900 border border-neutral-600 rounded px-3 py-2 text-sm text-white focus:outline-none focus:border-orange-500 resize-none"
+                  />
+                </div>
                 <button
                   onClick={handleDeposit}
                   disabled={txPending}
@@ -483,16 +471,6 @@ export default function Home() {
               </div>
             )}
 
-            {/* Heartbeat */}
-            {vault.isActive && !vault.isClaimed && !expired && (
-              <button
-                onClick={handleHeartbeat}
-                disabled={txPending}
-                className="w-full bg-green-700 hover:bg-green-600 disabled:opacity-50 text-white font-bold py-2 px-4 rounded text-sm transition-colors"
-              >
-                {txPending ? "SIGNING..." : isSimulation ? "♥ SEND HEARTBEAT (SIMULATION)" : "♥ SEND HEARTBEAT"}
-              </button>
-            )}
 
             {/* Withdraw */}
             {vault.isActive && !vault.isClaimed && (

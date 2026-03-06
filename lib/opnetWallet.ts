@@ -140,6 +140,27 @@ export async function encodeDeposit(
   ));
 }
 
+export async function encodeDepositWithMessage(
+  heirAddress: string,
+  timerBlocks: bigint,
+  satoshis: bigint,
+  message: string
+): Promise<string> {
+  const sel = await makeSelector("depositWithMessage(address,u64,u256,string)");
+  const msgBytes = new TextEncoder().encode(message);
+  const msgLen = new Uint8Array(4);
+  const view = new DataView(msgLen.buffer);
+  view.setUint32(0, msgBytes.length, false); // big-endian
+  return toHex(concat(
+    writeU32BE(sel),
+    decodeAddressTo32Bytes(heirAddress),
+    writeU64BE(timerBlocks),
+    writeU256BE(satoshis),
+    msgLen,
+    msgBytes
+  ));
+}
+
 export async function encodeHeartbeat(): Promise<string> {
   return toHex(writeU32BE(await makeSelector("heartbeat()")));
 }
