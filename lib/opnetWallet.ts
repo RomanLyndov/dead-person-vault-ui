@@ -1,6 +1,6 @@
 "use client";
 
-import { bech32m } from "bech32";
+import { bech32, bech32m } from "bech32";
 import type { OPWallet } from "@btc-vision/transaction";
 import type { UTXO } from "@btc-vision/transaction";
 
@@ -102,8 +102,15 @@ function writeU256BE(v: bigint): Uint8Array {
 }
 
 function decodeAddressTo32Bytes(addr: string): Uint8Array {
-  const decoded = bech32m.decode(addr, 256);
-  const bytes = bech32m.fromWords(decoded.words.slice(1));
+  // OP_NET opt1q... addresses use bech32 (witness v0); opt1p.../opt1s... use bech32m (v1+).
+  // Try bech32m first, fall back to bech32 if the checksum doesn't match.
+  let words: number[];
+  try {
+    words = bech32m.decode(addr, 256).words;
+  } catch {
+    words = bech32.decode(addr, 256).words;
+  }
+  const bytes = bech32m.fromWords(words.slice(1));
   if (bytes.length !== 32) {
     throw new Error(`Expected 32-byte address, got ${bytes.length} from: ${addr}`);
   }
