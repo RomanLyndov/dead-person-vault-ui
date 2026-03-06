@@ -173,6 +173,97 @@ export async function encodeWithdraw(): Promise<string> {
   return toHex(writeU32BE(await makeSelector("withdraw()")));
 }
 
+// ─── On-chain vault state reading ─────────────────────────────────────────────
+
+export interface OnChainVaultInfo {
+  initialized: boolean;
+  claimed: boolean;
+  ownerHex: string;      // 32-byte hex
+  beneficiaryHex: string; // 32-byte hex
+  lastSeen: bigint;
+  timeout: bigint;
+  amount: bigint;
+  message: string;
+}
+
+export async function fetchVaultInfo(): Promise<OnChainVaultInfo | null> {
+  if (!VAULT_CONTRACT_ADDRESS) return null;
+  const sel = await makeSelector("getInfo()");
+  const calldata = "0x" + toHex(writeU32BE(sel));
+
+  try {
+    const resp = await fetch("https://testnet.opnet.org/api/v1/json-rpc", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        method: "opnet_call",
+        params: [{ to: VAULT_CONTRACT_ADDRESS, data: calldata }],
+        id: 1,
+      }),
+    });
+    const json = await resp.json();
+    console.log("getInfo() RPC result:", json);
+
+    // Try to extract hex result from various response shapes
+    const raw: string | undefined =
+      json?.result?.result ?? json?.result?.data ?? json?.result;
+    if (!raw || typeof raw !== "string") return null;
+
+    const clean = raw.startsWith("0x") ? raw.slice(2) : raw;
+    if (clean.length < 236) return null; // 118 bytes minimum
+
+    const bytes = new Uint8Array(clean.match(/.{2}/g)!.map((b: string) => parseInt(b, 16)));
+
+    const toHexStr = (b: Uint8Array) =>
+      Array.from(b).map((x) => x.toString(16).padStart(2, "0")).join("");
+
+    let lastSeen = 0n;
+    for (let i = 64; i < 72; i++) lastSeen = (lastSeen << 8n) | BigInt(bytes[i]!);
+    let timeout = 0n;
+    for (let i = 72; i < 80; i++) timeout = (timeout << 8n) | BigInt(bytes[i]!);
+    let amount = 0n;
+    for (let i = 80; i < 112; i++) amount = (amount << 8n) | BigInt(bytes[i]!);
+
+    const initialized = bytes[112] !== 0;
+    const claimed = bytes[113] !== 0;
+    let msgLen = 0;
+    for (let i = 114; i < 118; i++) msgLen = (msgLen << 8) | bytes[i]!;
+    const message =
+      msgLen > 0 && bytes.length >= 118 + msgLen
+        ? new TextDecoder().decode(bytes.slice(118, 118 + msgLen))
+        : "";
+
+    return {
+      initialized,
+      claimed,
+      ownerHex: toHexStr(bytes.slice(0, 32)),
+      beneficiaryHex: toHexStr(bytes.slice(32, 64)),
+      lastSeen,
+      timeout,
+      amount,
+      message,
+    };
+  } catch (e) {
+    console.error("fetchVaultInfo failed:", e);
+    return null;
+  }
+}
+
+// Returns SHA-256 of the connected wallet's public key (= OP_NET address in hex)
+export async function getMyAddressHex(): Promise<string | null> {
+  if (!isOpNetWalletInstalled()) return null;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const pubkeyHex: string = await (window.opnet as any).getPublicKey();
+    const bytes = new Uint8Array(pubkeyHex.match(/.{2}/g)!.map((b: string) => parseInt(b, 16)));
+    const hashBuf = await crypto.subtle.digest("SHA-256", bytes);
+    return Array.from(new Uint8Array(hashBuf)).map((b) => b.toString(16).padStart(2, "0")).join("");
+  } catch {
+    return null;
+  }
+}
+
 // ─── Transaction signing & broadcast ─────────────────────────────────────────
 export interface TxResult {
   success: boolean;
