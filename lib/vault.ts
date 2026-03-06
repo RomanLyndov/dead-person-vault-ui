@@ -10,7 +10,7 @@ export interface VaultState {
 }
 
 export interface VaultEvent {
-  type: "Deposit" | "Heartbeat" | "Claimed" | "Error";
+  type: "Deposit" | "Heartbeat" | "Claimed" | "Withdrawn" | "Error";
   message: string;
   block: bigint;
   timestamp: Date;

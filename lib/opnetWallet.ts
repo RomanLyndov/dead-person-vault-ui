@@ -4,9 +4,9 @@ import type { OPWallet } from "@btc-vision/transaction";
 import type { UTXO } from "@btc-vision/transaction";
 
 // ─── Config ──────────────────────────────────────────────────────────────────
-export const VAULT_CONTRACT_ADDRESS = "opt1sqzhu4nxjyj7hgwx4khnfm5h5cp39xxymcsdjzrs4";
+export const VAULT_CONTRACT_ADDRESS = "opt1sqrx6feek2ky0pu44l7anzym26d7lj6jas59eyv89";
 // 32-byte contract public key in hex (used as `contract` field in interaction params)
-export const VAULT_CONTRACT_PUBKEY = "6a2c571a7a5b0e2a38eeee25c1be90a5c9efd8917954ed133109a144506abd0c";
+export const VAULT_CONTRACT_PUBKEY = "3647f8d8a3daf372e852e13a10bad07493bb518298a782d9e11f52e30db0ff9d";
 export const OPNET_PRIORITY_FEE = 1000n; // satoshis
 export const OPNET_DEFAULT_FEE_RATE = 10;  // sat/vbyte fallback
 export const OPNET_GAS_SAT_FEE = 330n;    // sat — passed to wallet for gas
@@ -146,6 +146,10 @@ export async function encodeHeartbeat(): Promise<string> {
 
 export async function encodeClaim(): Promise<string> {
   return toHex(writeU32BE(await makeSelector("claim()")));
+}
+
+export async function encodeWithdraw(): Promise<string> {
+  return toHex(writeU32BE(await makeSelector("withdraw()")));
 }
 
 // ─── Transaction signing & broadcast ─────────────────────────────────────────

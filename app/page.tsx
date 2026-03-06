@@ -17,16 +17,18 @@ import {
   connectOpNetWallet,
   getConnectedAccounts,
   getWalletBalance,
+  isOpNetWalletInstalled,
   fetchUTXOs,
   fetchFeeRate,
   encodeDeposit,
   encodeHeartbeat,
   encodeClaim,
+  encodeWithdraw,
   sendVaultInteraction,
 } from "../lib/opnetWallet";
 
 const DEMO_OWNER = "opt1pvytqa0xkzm2nkzr8rf8kwvpqrjjpazjm9uwa";
-const DEMO_HEIR = "opt1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+const DEMO_HEIR = "0000000000000000000000000000000000000000000000000000000000000000";
 
 function initialState(): VaultState {
   return {
@@ -111,7 +113,28 @@ export default function Home() {
     return walletAddress;
   }
 
+  async function handleUseMyWallet() {
+    if (!isOpNetWalletInstalled()) {
+      showTx("err", "OPWallet not connected");
+      return;
+    }
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const pubkeyHex: string = await (window as any).opnet.getPublicKey();
+      const bytes = new Uint8Array(pubkeyHex.match(/.{2}/g)!.map((b) => parseInt(b, 16)));
+      const hashBuf = await crypto.subtle.digest("SHA-256", bytes);
+      const hex = Array.from(new Uint8Array(hashBuf))
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join("");
+      setHeirAddress(hex);
+      showTx("ok", "Filled heir address from your wallet public key");
+    } catch (e) {
+      showTx("err", "Could not derive address: " + (e instanceof Error ? e.message : String(e)));
+    }
+  }
+
   async function handleDeposit() {
+    console.log("DEPOSIT CLICKED");
     const satoshis = BigInt(Math.round(parseFloat(depositAmount) * 1e8));
     if (satoshis <= 0n) return;
     const duration = BigInt(parseInt(timerDays)) * BLOCKS_PER_DAY;
@@ -128,7 +151,7 @@ export default function Home() {
       const [utxos, feeRate, calldata] = await Promise.all([fetchUTXOs(), fetchFeeRate(), encodeDeposit(heirAddress, duration, satoshis)]);
       if (utxos.length === 0) throw new Error("No UTXOs available. Fund your wallet first.");
       showTx("info", "Check OPWallet to sign...");
-      const result = await sendVaultInteraction(calldata, utxos, feeRate);
+      const result = await sendVaultInteraction(calldata, utxos, feeRate, addr!);
       if (result.success) {
         showTx("ok", "Deposit sent! TX: " + (result.txId?.slice(0, 16) ?? "") + "...");
         setVault((v) => ({ ...v, isActive: true, balance: v.balance + satoshis, lastHeartbeat: v.currentBlock, timerDuration: duration }));
@@ -158,7 +181,7 @@ export default function Home() {
     try {
       const [utxos, feeRate, calldata] = await Promise.all([fetchUTXOs(), fetchFeeRate(), encodeHeartbeat()]);
       showTx("info", "Check OPWallet to sign...");
-      const result = await sendVaultInteraction(calldata, utxos, feeRate);
+      const result = await sendVaultInteraction(calldata, utxos, feeRate, addr!);
       if (result.success) {
         showTx("ok", "Heartbeat sent! TX: " + (result.txId?.slice(0, 16) ?? "") + "...");
         setVault((v) => ({ ...v, lastHeartbeat: v.currentBlock }));
@@ -166,6 +189,36 @@ export default function Home() {
       } else {
         showTx("err", result.error ?? "Transaction failed");
         addEvent("Error", result.error ?? "Heartbeat failed", vault.currentBlock);
+      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Unknown error";
+      showTx("err", msg);
+      addEvent("Error", msg, vault.currentBlock);
+    } finally { setTxPending(false); }
+  }
+
+  async function handleWithdraw() {
+    if (!vault.isActive || vault.isClaimed) return;
+    if (isSimulation) {
+      setVault((v) => ({ ...v, isActive: false, balance: 0n }));
+      addEvent("Withdrawn", "[SIMULATION] Owner withdrew " + formatBTC(vault.balance), vault.currentBlock);
+      return;
+    }
+    const addr = await ensureConnected();
+    if (!addr) return;
+    setTxPending(true);
+    showTx("info", "Building withdraw transaction...");
+    try {
+      const [utxos, feeRate, calldata] = await Promise.all([fetchUTXOs(), fetchFeeRate(), encodeWithdraw()]);
+      showTx("info", "Check OPWallet to sign...");
+      const result = await sendVaultInteraction(calldata, utxos, feeRate, addr!);
+      if (result.success) {
+        showTx("ok", "Withdrawn! TX: " + (result.txId?.slice(0, 16) ?? "") + "...");
+        setVault((v) => ({ ...v, isActive: false, balance: 0n }));
+        addEvent("Withdrawn", "On-chain withdrawal sent", vault.currentBlock);
+      } else {
+        showTx("err", result.error ?? "Transaction failed");
+        addEvent("Error", result.error ?? "Withdraw failed", vault.currentBlock);
       }
     } catch (e) {
       const msg = e instanceof Error ? e.message : "Unknown error";
@@ -189,7 +242,7 @@ export default function Home() {
     try {
       const [utxos, feeRate, calldata] = await Promise.all([fetchUTXOs(), fetchFeeRate(), encodeClaim()]);
       showTx("info", "Check OPWallet to sign...");
-      const result = await sendVaultInteraction(calldata, utxos, feeRate);
+      const result = await sendVaultInteraction(calldata, utxos, feeRate, addr!);
       if (result.success) {
         showTx("ok", "Claim sent! TX: " + (result.txId?.slice(0, 16) ?? "") + "...");
         setVault((v) => ({ ...v, isClaimed: true, isActive: false, balance: 0n }));
@@ -394,16 +447,28 @@ export default function Home() {
                   </div>
                 </div>
                 <div>
-                  <label className="text-xs text-neutral-500 block mb-1">
-                    Heir address (opt1... or tb1p...)
-                  </label>
+                  <div className="flex items-center justify-between mb-1">
+                    <label className="text-xs text-neutral-500">
+                      Heir address (64-char hex)
+                    </label>
+                    <button
+                      type="button"
+                      onClick={handleUseMyWallet}
+                      className="text-xs text-orange-400 hover:text-orange-300 underline"
+                    >
+                      Use my wallet
+                    </button>
+                  </div>
                   <input
                     type="text"
                     value={heirAddress}
                     onChange={(e) => setHeirAddress(e.target.value)}
-                    placeholder="opt1... or tb1p..."
+                    placeholder="64-char hex (e.g. a1b2c3...)"
                     className="w-full bg-neutral-900 border border-neutral-600 rounded px-3 py-2 text-xs font-mono text-white focus:outline-none focus:border-orange-500"
                   />
+                  <p className="text-xs text-neutral-600 mt-1">
+                    Your OP_NET address = SHA-256 of your ML-DSA public key
+                  </p>
                 </div>
                 <button
                   onClick={handleDeposit}
@@ -426,6 +491,17 @@ export default function Home() {
                 className="w-full bg-green-700 hover:bg-green-600 disabled:opacity-50 text-white font-bold py-2 px-4 rounded text-sm transition-colors"
               >
                 {txPending ? "SIGNING..." : isSimulation ? "♥ SEND HEARTBEAT (SIMULATION)" : "♥ SEND HEARTBEAT"}
+              </button>
+            )}
+
+            {/* Withdraw */}
+            {vault.isActive && !vault.isClaimed && (
+              <button
+                onClick={handleWithdraw}
+                disabled={txPending}
+                className="w-full border border-neutral-500 hover:border-orange-400 text-neutral-300 hover:text-orange-400 disabled:opacity-50 font-bold py-2 px-4 rounded text-sm transition-colors"
+              >
+                {txPending ? "SIGNING..." : isSimulation ? "↩ WITHDRAW (CANCEL VAULT) (SIMULATION)" : "↩ WITHDRAW (CANCEL VAULT)"}
               </button>
             )}
 
@@ -525,6 +601,8 @@ export default function Home() {
                           ? "#22c55e"
                           : ev.type === "Claimed"
                           ? "#a855f7"
+                          : ev.type === "Withdrawn"
+                          ? "#facc15"
                           : "#ef4444",
                     }}
                   >
@@ -537,6 +615,8 @@ export default function Home() {
                             ? "text-green-400"
                             : ev.type === "Claimed"
                             ? "text-purple-400"
+                            : ev.type === "Withdrawn"
+                            ? "text-yellow-400"
                             : "text-red-400"
                         }
                       >
