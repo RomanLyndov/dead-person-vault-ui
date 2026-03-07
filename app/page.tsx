@@ -1,9 +1,8 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect } from "react";
 import {
   VaultState,
-  VaultEvent,
   formatBTC,
   blocksRemaining,
   isExpired,
@@ -24,8 +23,125 @@ import {
   encodeWithdraw,
   sendVaultInteraction,
   fetchVaultInfo,
+  fetchCurrentBlock,
   getMyAddressHex,
+  type OnChainVaultInfo,
 } from "../lib/opnetWallet";
+
+// ─── localStorage persistence ─────────────────────────────────────────────────
+const VAULT_KEY = "dpv_vault";
+const ROLE_KEY  = "dpv_role";
+
+function saveVault(v: VaultState, role: string) {
+  try {
+    localStorage.setItem(VAULT_KEY, JSON.stringify({
+      ...v,
+      balance: v.balance.toString(),
+      lastHeartbeat: v.lastHeartbeat.toString(),
+      timerDuration: v.timerDuration.toString(),
+      currentBlock: v.currentBlock.toString(),
+    }));
+    localStorage.setItem(ROLE_KEY, role);
+  } catch { /* quota */ }
+}
+
+function loadVault(): { vault: VaultState; role: string } | null {
+  try {
+    const raw = localStorage.getItem(VAULT_KEY);
+    if (!raw) return null;
+    const d = JSON.parse(raw);
+    return {
+      vault: {
+        ...d,
+        balance: BigInt(d.balance),
+        lastHeartbeat: BigInt(d.lastHeartbeat),
+        timerDuration: BigInt(d.timerDuration),
+        currentBlock: BigInt(d.currentBlock),
+      },
+      role: localStorage.getItem(ROLE_KEY) ?? "unknown",
+    };
+  } catch { return null; }
+}
+
+function clearVault() {
+  try { localStorage.removeItem(VAULT_KEY); localStorage.removeItem(ROLE_KEY); } catch { /* ignore */ }
+}
+
+const PENDING_KEY = "dpv_pending_tx";
+function savePendingTx(txId: string) {
+  try { localStorage.setItem(PENDING_KEY, JSON.stringify({ txId, ts: Date.now() })); } catch { /* ignore */ }
+}
+function hasPendingTx(): boolean {
+  try {
+    const raw = localStorage.getItem(PENDING_KEY);
+    if (!raw) return false;
+    const { ts } = JSON.parse(raw);
+    return Date.now() - ts < 10 * 60 * 1000; // 10 minutes
+  } catch { return false; }
+}
+function clearPendingTx() {
+  try { localStorage.removeItem(PENDING_KEY); } catch { /* ignore */ }
+}
+
+// Keep OnChainVaultInfo cache for chain sync
+const CACHE_KEY = "dpv_vault_cache";
+function saveCache(info: OnChainVaultInfo) {
+  try {
+    localStorage.setItem(CACHE_KEY, JSON.stringify({
+      ...info,
+      lastSeen: info.lastSeen.toString(),
+      timeout: info.timeout.toString(),
+      amount: info.amount.toString(),
+    }));
+  } catch { /* quota exceeded etc */ }
+}
+function loadCache(): OnChainVaultInfo | null {
+  try {
+    const raw = localStorage.getItem(CACHE_KEY);
+    if (!raw) return null;
+    const d = JSON.parse(raw);
+    return { ...d, lastSeen: BigInt(d.lastSeen), timeout: BigInt(d.timeout), amount: BigInt(d.amount) };
+  } catch { return null; }
+}
+function clearCache() {
+  try { localStorage.removeItem(CACHE_KEY); } catch { /* ignore */ }
+}
+
+// ─── URL-based vault sharing ──────────────────────────────────────────────────
+function vaultToShareUrl(v: VaultState): string {
+  const payload = JSON.stringify({
+    owner: v.owner,
+    heir: v.heir,
+    balance: v.balance.toString(),
+    lastHeartbeat: v.lastHeartbeat.toString(),
+    timerDuration: v.timerDuration.toString(),
+    currentBlock: v.currentBlock.toString(),
+    message: v.message ?? "",
+  });
+  const b64 = btoa(payload);
+  return `${window.location.origin}${window.location.pathname}?v=${encodeURIComponent(b64)}`;
+}
+
+function loadVaultFromUrl(): VaultState | null {
+  try {
+    const params = new URLSearchParams(window.location.search);
+    const raw = params.get("v");
+    if (!raw) return null;
+    const d = JSON.parse(atob(decodeURIComponent(raw)));
+    return {
+      isActive: true,
+      isClaimed: false,
+      isPending: false,
+      owner: d.owner,
+      heir: d.heir,
+      balance: BigInt(d.balance),
+      lastHeartbeat: BigInt(d.lastHeartbeat),
+      timerDuration: BigInt(d.timerDuration),
+      currentBlock: d.currentBlock ? BigInt(d.currentBlock) : 840000n,
+      message: d.message || undefined,
+    };
+  } catch { return null; }
+}
 
 const DEMO_HEIR = "0000000000000000000000000000000000000000000000000000000000000000";
 
@@ -33,6 +149,7 @@ function emptyVault(): VaultState {
   return {
     isActive: false,
     isClaimed: false,
+    isPending: false,
     owner: "",
     heir: DEMO_HEIR,
     balance: 0n,
@@ -47,7 +164,6 @@ type Role = "owner" | "heir" | "observer" | "unknown";
 
 export default function Home() {
   const [vault, setVault] = useState<VaultState>(emptyVault());
-  const [events, setEvents] = useState<VaultEvent[]>([]);
   const [depositAmount, setDepositAmount] = useState("0.01");
   const [timerBlocks, setTimerBlocks] = useState("5");
   const [heirAddress, setHeirAddress] = useState(DEMO_HEIR);
@@ -66,17 +182,30 @@ export default function Home() {
 
   const isSimulation = !VAULT_CONTRACT_ADDRESS;
 
-  // Simulated block ticker
+  // Block ticker: fake 3s increments in simulation, real poll every 60s in live mode
   useEffect(() => {
-    const interval = setInterval(() => {
-      setVault((v) => ({ ...v, currentBlock: v.currentBlock + 1n }));
-    }, 3000);
-    return () => clearInterval(interval);
+    if (isSimulation) {
+      const interval = setInterval(() => {
+        setVault((v) => ({ ...v, currentBlock: v.currentBlock + 1n }));
+      }, 3000);
+      return () => clearInterval(interval);
+    } else {
+      // Fetch immediately on mount so block is correct before wallet connects
+      fetchCurrentBlock().then((block) => setVault((v) => ({ ...v, currentBlock: block }))).catch(() => {});
+      const interval = setInterval(() => {
+        fetchCurrentBlock().then((block) => setVault((v) => ({ ...v, currentBlock: block }))).catch(() => {});
+      }, 60000);
+      return () => clearInterval(interval);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const addEvent = useCallback((type: VaultEvent["type"], message: string, block: bigint) => {
-    setEvents((prev) => [{ type, message, block, timestamp: new Date() }, ...prev.slice(0, 19)]);
-  }, []);
+  // Auto-save vault state to localStorage whenever it changes
+  useEffect(() => {
+    if (vault.isActive || vault.isClaimed || vault.isPending) {
+      saveVault(vault, role);
+    }
+  }, [vault, role]);
 
   function showTx(type: "ok" | "err" | "info", text: string) {
     setTxMessage({ type, text });
@@ -91,38 +220,70 @@ export default function Home() {
     return "observer";
   }
 
+  // Apply OnChainVaultInfo to React state
+  function applyInfo(info: OnChainVaultInfo, hex: string | null, currentBlock?: bigint) {
+    if (!info.initialized) return; // tx pending — keep local state
+    const newVault = (v: VaultState) => ({
+      ...v,
+      isPending: false,
+      isActive: !info.claimed,
+      isClaimed: info.claimed,
+      owner: info.ownerHex,
+      heir: info.beneficiaryHex,
+      balance: info.amount,
+      lastHeartbeat: info.lastSeen,
+      timerDuration: info.timeout,
+      currentBlock: currentBlock ?? v.currentBlock,
+      message: info.message || undefined,
+    });
+    setVault(newVault);
+    if (hex !== null) {
+      const r = determineRole(info.ownerHex, info.beneficiaryHex, hex);
+      setRole(r);
+      setVault((v) => { saveVault(newVault(v), r); return newVault(v); });
+    }
+  }
+
   // Fetch on-chain vault state and update UI
   async function syncFromChain(hex: string | null) {
     setIsSyncing(true);
     setSyncError(null);
     try {
-      const info = await fetchVaultInfo();
+      const [info, currentBlock] = await Promise.all([
+        fetchVaultInfo(),
+        fetchCurrentBlock().catch(() => null),
+      ]);
+      // Seed the real block number into state so expiry is accurate
+      if (currentBlock !== null) {
+        setVault((v) => ({ ...v, currentBlock }));
+      }
       if (!info) {
-        setSyncError("Could not read vault state. The RPC call may have failed — check console.");
+        setSyncError("RPC returned empty — vault may not exist yet.");
         return;
       }
       if (!info.initialized) {
-        setSyncError("Vault is not initialized on-chain.");
-        setVault((v) => ({ ...v, isActive: false, isClaimed: false }));
-        setRole("unknown");
+        if (hasPendingTx()) {
+          // Tx recently broadcast — keep local state, just show status
+          setVault((v) => {
+            if (v.isActive && hex) setRole(determineRole(v.owner, v.heir, hex));
+            return v;
+          });
+          setSyncError("Waiting for chain confirmation (tx pending)...");
+        } else {
+          // No pending tx — chain says no vault exists
+          clearCache();
+          clearVault();
+          setVault((v) => ({ ...v, isActive: false, isClaimed: false }));
+          setRole("unknown");
+          setSyncError(null);
+        }
         return;
       }
-      setVault((v) => ({
-        ...v,
-        isActive: !info.claimed,
-        isClaimed: info.claimed,
-        owner: info.ownerHex,
-        heir: info.beneficiaryHex,
-        balance: info.amount,
-        lastHeartbeat: info.lastSeen,
-        timerDuration: info.timeout,
-        message: info.message || undefined,
-      }));
-      const r = determineRole(info.ownerHex, info.beneficiaryHex, hex);
-      setRole(r);
+      saveCache(info);
+      applyInfo(info, hex, currentBlock ?? undefined);
       setSyncError(null);
     } catch (e) {
-      setSyncError("Sync failed: " + (e instanceof Error ? e.message : String(e)));
+      setSyncError(e instanceof Error ? e.message : String(e));
     } finally {
       setIsSyncing(false);
     }
@@ -147,8 +308,20 @@ export default function Home() {
     }
   }
 
-  // On load, check if already connected
+  // On load: restore vault from URL param > localStorage, then try live sync
   useEffect(() => {
+    const fromUrl = loadVaultFromUrl();
+    if (fromUrl) {
+      setVault(fromUrl);
+      // role determined after wallet connects
+    } else {
+      const saved = loadVault();
+      if (saved) {
+        setVault(saved.vault);
+        setRole(saved.role as Role);
+      }
+    }
+
     getConnectedAccounts().then(async (accounts) => {
       if (accounts.length > 0) {
         setWalletAddress(accounts[0]!);
@@ -170,13 +343,10 @@ export default function Home() {
   async function handleUseMyWallet() {
     if (!isOpNetWalletInstalled()) { showTx("err", "OPWallet not connected"); return; }
     try {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const pubkeyHex: string = await (window as any).opnet.getPublicKey();
-      const bytes = new Uint8Array(pubkeyHex.match(/.{2}/g)!.map((b: string) => parseInt(b, 16)));
-      const hashBuf = await crypto.subtle.digest("SHA-256", bytes);
-      const hex = Array.from(new Uint8Array(hashBuf)).map((b) => b.toString(16).padStart(2, "0")).join("");
+      const hex = await getMyAddressHex();
+      if (!hex) throw new Error("Could not derive address");
       setHeirAddress(hex);
-      showTx("ok", "Filled heir address from your wallet public key");
+      showTx("ok", "Filled heir address from your wallet");
     } catch (e) {
       showTx("err", "Could not derive address: " + (e instanceof Error ? e.message : String(e)));
     }
@@ -186,10 +356,15 @@ export default function Home() {
     const satoshis = BigInt(Math.round(parseFloat(depositAmount) * 1e8));
     if (satoshis <= 0n) return;
     const duration = BigInt(parseInt(timerBlocks));
+    if (duration <= 0n) { showTx("err", "Timer must be > 0 blocks"); return; }
     const msg = capsuleMessage.trim();
+    const cleanHeir = heirAddress.startsWith("0x") ? heirAddress.slice(2) : heirAddress;
+    if (myHex && cleanHeir === myHex) {
+      showTx("err", "You cannot set yourself as heir. Use the heir wallet's address.");
+      return;
+    }
     if (isSimulation) {
-      setVault((v) => ({ ...v, isActive: true, balance: v.balance + satoshis, lastHeartbeat: v.currentBlock, timerDuration: duration, message: msg || undefined }));
-      addEvent("Deposit", `[SIM] Deposited ${formatBTC(satoshis)}, timer: ${timerBlocks} blocks`, vault.currentBlock);
+      setVault((v) => ({ ...v, isActive: true, owner: myHex ?? v.owner, heir: heirAddress, balance: v.balance + satoshis, lastHeartbeat: v.currentBlock, timerDuration: duration, message: msg || undefined }));
       setRole("owner");
       return;
     }
@@ -206,18 +381,39 @@ export default function Home() {
       showTx("info", "Check OPWallet to sign...");
       const result = await sendVaultInteraction(calldata, utxos, feeRate, addr!);
       if (result.success) {
-        showTx("ok", "Vault activated! TX: " + (result.txId?.slice(0, 16) ?? "") + "...");
-        setVault((v) => ({ ...v, isActive: true, balance: v.balance + satoshis, lastHeartbeat: v.currentBlock, timerDuration: duration, message: msg || undefined }));
+        if (result.txId) savePendingTx(result.txId);
+        showTx("info", "TX broadcast! Waiting for on-chain confirmation...");
+        setVault((v) => ({ ...v, isPending: true, isActive: false, owner: myHex ?? v.owner, heir: heirAddress, balance: v.balance + satoshis, lastHeartbeat: v.currentBlock, timerDuration: duration, message: msg || undefined }));
         setRole("owner");
-        addEvent("Deposit", `Deposited ${formatBTC(satoshis)}, timer: ${timerBlocks} blocks`, vault.currentBlock);
+        // Auto-poll chain until deposit confirms (max 20 attempts × 15s = 5 min)
+        let attempts = 0;
+        const poll = setInterval(async () => {
+          attempts++;
+          try {
+            const [info, currentBlock] = await Promise.all([
+              fetchVaultInfo(),
+              fetchCurrentBlock().catch(() => null),
+            ]);
+            if (info?.initialized) {
+              clearInterval(poll);
+              clearPendingTx();
+              saveCache(info);
+              applyInfo(info, myHex, currentBlock ?? undefined);
+              showTx("ok", "Vault confirmed on-chain!");
+              setSyncError(null);
+            } else if (attempts >= 20) {
+              clearInterval(poll);
+              clearPendingTx();
+              setVault((v) => ({ ...v, isPending: false, isActive: false }));
+              setSyncError("Transaction reverted on-chain. Check gas or heir address.");
+            }
+          } catch { /* keep polling */ }
+        }, 15000);
       } else {
         showTx("err", result.error ?? "Transaction failed");
-        addEvent("Error", result.error ?? "Deposit failed", vault.currentBlock);
       }
     } catch (e) {
-      const m = e instanceof Error ? e.message : "Unknown error";
-      showTx("err", m);
-      addEvent("Error", m, vault.currentBlock);
+      showTx("err", e instanceof Error ? e.message : "Unknown error");
     } finally { setTxPending(false); }
   }
 
@@ -225,7 +421,6 @@ export default function Home() {
     if (!vault.isActive || vault.isClaimed) return;
     if (isSimulation) {
       setVault((v) => ({ ...v, isActive: false, balance: 0n, message: undefined }));
-      addEvent("Withdrawn", `[SIM] Owner cancelled vault`, vault.currentBlock);
       setRole("unknown");
       return;
     }
@@ -238,18 +433,16 @@ export default function Home() {
       showTx("info", "Check OPWallet to sign...");
       const result = await sendVaultInteraction(calldata, utxos, feeRate, addr!);
       if (result.success) {
+        clearCache();
+        clearVault();
         showTx("ok", "Vault cancelled! TX: " + (result.txId?.slice(0, 16) ?? "") + "...");
         setVault((v) => ({ ...v, isActive: false, balance: 0n, message: undefined }));
         setRole("unknown");
-        addEvent("Withdrawn", "Vault cancelled on-chain", vault.currentBlock);
       } else {
         showTx("err", result.error ?? "Transaction failed");
-        addEvent("Error", result.error ?? "Withdraw failed", vault.currentBlock);
       }
     } catch (e) {
-      const m = e instanceof Error ? e.message : "Unknown error";
-      showTx("err", m);
-      addEvent("Error", m, vault.currentBlock);
+      showTx("err", e instanceof Error ? e.message : "Unknown error");
     } finally { setTxPending(false); }
   }
 
@@ -257,7 +450,6 @@ export default function Home() {
     if (!vault.isActive || vault.isClaimed) return;
     if (isSimulation) {
       setVault((v) => ({ ...v, isClaimed: true, isActive: false, balance: 0n }));
-      addEvent("Claimed", `[SIM] Heir claimed ${formatBTC(vault.balance)}`, vault.currentBlock);
       return;
     }
     const addr = await ensureConnected();
@@ -271,21 +463,18 @@ export default function Home() {
       if (result.success) {
         showTx("ok", "Claimed! TX: " + (result.txId?.slice(0, 16) ?? "") + "...");
         setVault((v) => ({ ...v, isClaimed: true, isActive: false, balance: 0n }));
-        addEvent("Claimed", "Vault claimed on-chain", vault.currentBlock);
       } else {
         showTx("err", result.error ?? "Transaction failed");
-        addEvent("Error", result.error ?? "Claim failed", vault.currentBlock);
       }
     } catch (e) {
-      const m = e instanceof Error ? e.message : "Unknown error";
-      showTx("err", m);
-      addEvent("Error", m, vault.currentBlock);
+      showTx("err", e instanceof Error ? e.message : "Unknown error");
     } finally { setTxPending(false); }
   }
 
   function handleReset() {
+    clearCache();
+    clearVault();
     setVault(emptyVault());
-    setEvents([]);
     setTxMessage(null);
     setCapsuleMessage("");
     setRole("unknown");
@@ -328,9 +517,8 @@ export default function Home() {
         <div className="flex items-start justify-between flex-wrap gap-4">
           <div>
             <h1 className="text-3xl font-black tracking-tight">
-              <span className="text-amber-400">☠</span>{" "}
               <span className="bg-gradient-to-r from-amber-400 to-orange-500 bg-clip-text text-transparent">
-                DEAD PERSON VAULT
+                LEGACY VAULT
               </span>
             </h1>
             <p className="text-zinc-500 text-sm mt-1">Bitcoin inheritance on-chain — powered by OP_NET</p>
@@ -349,6 +537,14 @@ export default function Home() {
                   <span className={`text-xs px-2 py-0.5 rounded-full border font-bold ${roleColor[role]}`}>
                     {roleLabel[role]}
                   </span>
+                )}
+                {myHex && (
+                  <button
+                    onClick={() => navigator.clipboard.writeText(myHex).then(() => showTx("ok", "Your OP_NET address copied"))}
+                    className="text-xs text-zinc-600 hover:text-zinc-400 font-mono transition-colors"
+                    title="Click to copy your OP_NET address (use this as heir address)">
+                    {shortAddr(myHex)} 📋
+                  </button>
                 )}
               </div>
             ) : (
@@ -395,24 +591,33 @@ export default function Home() {
             <div className="flex items-center gap-3 mb-4">
               <div className={`w-3 h-3 rounded-full flex-shrink-0 ${
                 vault.isClaimed ? "bg-violet-400 shadow-[0_0_8px_#a78bfa]"
+                : vault.isPending ? "bg-amber-400 animate-pulse shadow-[0_0_8px_#f59e0b]"
                 : vault.isActive && expired ? "bg-red-500 animate-pulse shadow-[0_0_8px_#ef4444]"
                 : vault.isActive ? "bg-emerald-400 animate-pulse shadow-[0_0_8px_#34d399]"
                 : "bg-zinc-600"
               }`} />
               <span className={`text-lg font-black tracking-wide ${
                 vault.isClaimed ? "text-violet-400"
+                : vault.isPending ? "text-amber-400"
                 : vault.isActive && expired ? "text-red-400"
                 : vault.isActive ? "text-emerald-400"
                 : "text-zinc-500"
               }`}>
                 {vault.isClaimed ? "CLAIMED"
+                  : vault.isPending ? "PENDING CONFIRMATION"
                   : vault.isActive && expired ? "EXPIRED — CLAIMABLE"
                   : vault.isActive ? "ACTIVE"
                   : "INACTIVE"}
               </span>
             </div>
 
-            {vault.isActive || vault.isClaimed ? (
+            {vault.isPending && (
+              <p className="text-amber-400 text-sm">
+                Transaction submitted — waiting for OP_NET to confirm. This can take a few minutes.
+              </p>
+            )}
+
+            {(vault.isActive || vault.isClaimed) ? (
               <div className="space-y-2 text-sm">
                 <Row label="Balance" value={formatBTC(vault.balance)} accent />
                 <Row label="Owner" value={shortAddr(vault.owner)} mono />
@@ -426,6 +631,18 @@ export default function Home() {
                   ? 'No active vault found. Create one below, or click "Sync from chain" if you expect one to exist.'
                   : "Connect your wallet to see vault state."}
               </p>
+            )}
+
+            {/* Share link for heir */}
+            {vault.isActive && !vault.isClaimed && (
+              <button
+                onClick={() => {
+                  const url = vaultToShareUrl(vault);
+                  navigator.clipboard.writeText(url).then(() => showTx("ok", "Share link copied! Send it to your heir."));
+                }}
+                className="mt-3 w-full text-xs border border-zinc-700 hover:border-zinc-500 text-zinc-400 hover:text-white py-1.5 px-3 rounded-lg transition-colors">
+                🔗 Copy share link for heir
+              </button>
             )}
 
             {/* Time capsule message */}
@@ -467,7 +684,7 @@ export default function Home() {
             )}
 
             {/* Deposit form — show when no active vault or simulation */}
-            {(!vault.isActive && !vault.isClaimed && (role === "owner" || role === "unknown" || isSimulation)) && (
+            {(!vault.isPending && !vault.isActive && !vault.isClaimed && (role === "owner" || role === "unknown" || isSimulation)) && (
               <div className="space-y-3">
                 <div className="flex gap-2">
                   <div className="flex-1">
@@ -511,8 +728,15 @@ export default function Home() {
               </div>
             )}
 
+            {/* Pending notice */}
+            {vault.isPending && (
+              <div className="text-xs text-amber-500 bg-amber-950/40 border border-amber-800 rounded-lg px-3 py-2 text-center">
+                ⏳ Waiting for on-chain confirmation before actions are available...
+              </div>
+            )}
+
             {/* Heir — claim */}
-            {vault.isActive && !vault.isClaimed && (role === "heir" || isSimulation) && (
+            {!vault.isPending && vault.isActive && !vault.isClaimed && (role === "heir" || isSimulation) && (
               <button onClick={handleClaim} disabled={txPending || !expired}
                 className={`w-full font-black py-2.5 px-4 rounded-lg text-sm transition-colors ${
                   expired
@@ -527,7 +751,7 @@ export default function Home() {
             )}
 
             {/* Owner — cancel */}
-            {vault.isActive && !vault.isClaimed && (role === "owner" || isSimulation) && (
+            {!vault.isPending && vault.isActive && !vault.isClaimed && (role === "owner" || isSimulation) && (
               <button onClick={handleWithdraw} disabled={txPending}
                 className="w-full border border-zinc-700 hover:border-zinc-500 text-zinc-400 hover:text-white disabled:opacity-50 font-bold py-2 px-4 rounded-lg text-sm transition-colors">
                 {txPending ? "SIGNING..." : isSimulation ? "↩ CANCEL VAULT (SIMULATION)" : "↩ CANCEL VAULT"}
@@ -536,8 +760,24 @@ export default function Home() {
 
             {/* Observer with active vault */}
             {vault.isActive && !vault.isClaimed && role === "observer" && (
-              <div className="text-xs text-zinc-600 text-center py-2">
-                Connected wallet is neither owner nor heir of this vault.
+              <div className="space-y-2 text-xs">
+                <div className="text-zinc-500 text-center">Connected wallet is not the heir of this vault.</div>
+                {myHex && (
+                  <div className="bg-zinc-950 border border-zinc-800 rounded p-2 space-y-1">
+                    <div className="flex justify-between">
+                      <span className="text-zinc-600">Your hex:</span>
+                      <span className="text-zinc-400 font-mono">{shortAddr(myHex)}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-zinc-600">Vault heir:</span>
+                      <span className="text-zinc-400 font-mono">{shortAddr(vault.heir)}</span>
+                    </div>
+                    <button onClick={() => navigator.clipboard.writeText(myHex).then(() => showTx("ok", "Your hex copied — send to vault owner to set as heir"))}
+                      className="w-full mt-1 border border-zinc-700 hover:border-zinc-500 text-zinc-400 hover:text-white py-1 px-2 rounded transition-colors">
+                      Copy my address to share with owner
+                    </button>
+                  </div>
+                )}
               </div>
             )}
 
@@ -598,54 +838,6 @@ export default function Home() {
             </div>
           </div>
 
-          {/* Contract methods */}
-          <div className="rounded-xl border border-zinc-800 bg-zinc-900/40 p-4">
-            <div className="text-xs text-zinc-500 uppercase tracking-widest mb-3">Contract</div>
-            <div className="space-y-1 text-xs font-mono">
-              <Method name="deposit(address,u64,u256)" color="text-amber-400" />
-              <Method name="depositWithMessage(address,u64,u256,string)" color="text-amber-300" />
-              <Method name="withdraw()" color="text-emerald-400" />
-              <Method name="claim()" color="text-violet-400" />
-              <Method name="getInfo()" color="text-zinc-500" />
-            </div>
-            {VAULT_CONTRACT_ADDRESS && (
-              <div className="mt-3 text-xs text-zinc-600 font-mono break-all">{VAULT_CONTRACT_ADDRESS}</div>
-            )}
-          </div>
-
-          {/* Event log */}
-          <div className="rounded-xl border border-zinc-800 bg-zinc-900/40 p-4">
-            <div className="text-xs text-zinc-500 uppercase tracking-widest mb-3">Event Log</div>
-            {events.length === 0 ? (
-              <div className="text-zinc-700 text-sm italic">No events yet.</div>
-            ) : (
-              <div className="space-y-2 max-h-64 overflow-y-auto">
-                {events.map((ev, i) => (
-                  <div key={i} className="text-xs border-l-2 pl-2 py-0.5" style={{
-                    borderColor:
-                      ev.type === "Deposit" ? "#f59e0b"
-                      : ev.type === "Claimed" ? "#a78bfa"
-                      : ev.type === "Withdrawn" ? "#facc15"
-                      : ev.type === "Error" ? "#ef4444"
-                      : "#6b7280",
-                  }}>
-                    <div className="flex justify-between gap-2">
-                      <span className={
-                        ev.type === "Deposit" ? "text-amber-400"
-                        : ev.type === "Claimed" ? "text-violet-400"
-                        : ev.type === "Withdrawn" ? "text-yellow-400"
-                        : ev.type === "Error" ? "text-red-400"
-                        : "text-zinc-500"
-                      }>[{ev.type}]</span>
-                      <span className="text-zinc-600">#{ev.block.toString()}</span>
-                    </div>
-                    <div className="text-zinc-300">{ev.message}</div>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-
           {/* Block reference */}
           <div className="rounded-xl border border-zinc-800 bg-zinc-900/40 p-4">
             <div className="text-xs text-zinc-500 uppercase tracking-widest mb-2">Block Reference</div>
@@ -660,7 +852,7 @@ export default function Home() {
       </div>
 
       <div className="mt-8 border-t border-zinc-900 pt-4 text-center text-xs text-zinc-800">
-        Dead Person Vault — OP_NET Vibecoding — AssemblyScript WASM on Bitcoin
+        Legacy Vault — Bitcoin inheritance powered by OP_NET
       </div>
     </main>
   );
@@ -689,6 +881,3 @@ function Step({ n, color, title, children }: { n: string; color: string; title: 
   );
 }
 
-function Method({ name, color }: { name: string; color: string }) {
-  return <div className={`${color} opacity-75 hover:opacity-100 transition-opacity`}>{name}</div>;
-}

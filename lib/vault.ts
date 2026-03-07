@@ -1,6 +1,7 @@
 export interface VaultState {
   isActive: boolean;
   isClaimed: boolean;
+  isPending: boolean; // tx broadcast but not yet confirmed on-chain
   owner: string;
   heir: string;
   balance: bigint; // satoshis

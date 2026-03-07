@@ -2,8 +2,8 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Dead Person Vault",
-  description: "On-chain Bitcoin inheritance system on OP_NET",
+  title: "Legacy Vault",
+  description: "Bitcoin inheritance on-chain — powered by OP_NET",
 };
 
 export default function RootLayout({
